@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS memories (
   disclosable TEXT NOT NULL,
   consented INTEGER NOT NULL DEFAULT 0,
   source TEXT NOT NULL,
+  provenance TEXT NOT NULL DEFAULT 'L1_shared',
+  valid_from TEXT,
+  valid_until TEXT,
+  superseded_by TEXT,
   thread_key TEXT NOT NULL,
   affect TEXT,
   recall_count INTEGER NOT NULL DEFAULT 0,
@@ -90,6 +94,7 @@ CREATE TABLE IF NOT EXISTS relations (
   trust REAL NOT NULL,
   closeness REAL NOT NULL,
   valence REAL NOT NULL,
+  disengagement REAL NOT NULL DEFAULT 0,
   turns INTEGER NOT NULL DEFAULT 0,
   first_seen TEXT,
   last_seen TEXT,
@@ -229,6 +234,11 @@ function safeParseJson<T>(raw: unknown, fallback: T): T {
 }
 
 function rowToMemory(r: Record<string, unknown>): MemoryItem {
+  const createdAt = String(r.created_at)
+  const rawProv = String(r.provenance ?? '')
+  const provenance: MemoryItem['provenance'] = rawProv === 'L0_external' || rawProv === 'L1_shared' || rawProv === 'L2_internal'
+    ? rawProv
+    : (String(r.source) === 'life' ? 'L2_internal' : 'L1_shared')
   return {
     id: String(r.id),
     kind: String(r.kind) as MemoryItem['kind'],
@@ -239,11 +249,15 @@ function rowToMemory(r: Record<string, unknown>): MemoryItem {
     disclosable: String(r.disclosable) as MemoryItem['disclosable'],
     consented: Number(r.consented) === 1,
     source: String(r.source) as MemoryItem['source'],
+    provenance,
+    validFrom: r.valid_from ? String(r.valid_from) : createdAt,
+    validUntil: r.valid_until ? String(r.valid_until) : null,
+    supersededBy: r.superseded_by ? String(r.superseded_by) : null,
     threadKey: String(r.thread_key),
     affect: r.affect ? (String(r.affect) as AffectKind) : null,
     recallCount: Number(r.recall_count ?? 0),
     lastRecalledAt: r.last_recalled_at ? String(r.last_recalled_at) : null,
-    createdAt: String(r.created_at),
+    createdAt,
   }
 }
 
@@ -272,10 +286,26 @@ export class SqliteSoulStore implements SoulStore {
     }
     this.db = new DatabaseSync(dbPath)
     this.db.exec(SCHEMA_SQL)
-    // 兼容已存在的旧版 soul.db：若 relations 缺 tensions_json 则平滑补列
-    const cols = this.db.prepare('PRAGMA table_info(relations)').all() as Array<{ name?: string }>
-    if (!cols.some((c) => c.name === 'tensions_json')) {
+    // 平滑迁移已存在的旧版 soul.db（幂等补列，零数据丢失）
+    const relCols = this.db.prepare('PRAGMA table_info(relations)').all() as Array<{ name?: string }>
+    if (!relCols.some((c) => c.name === 'tensions_json')) {
       this.db.exec('ALTER TABLE relations ADD COLUMN tensions_json TEXT NOT NULL DEFAULT \'[]\'')
+    }
+    if (!relCols.some((c) => c.name === 'disengagement')) {
+      this.db.exec('ALTER TABLE relations ADD COLUMN disengagement REAL NOT NULL DEFAULT 0')
+    }
+    const memCols = this.db.prepare('PRAGMA table_info(memories)').all() as Array<{ name?: string }>
+    if (!memCols.some((c) => c.name === 'provenance')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN provenance TEXT NOT NULL DEFAULT \'L1_shared\'')
+    }
+    if (!memCols.some((c) => c.name === 'valid_from')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN valid_from TEXT')
+    }
+    if (!memCols.some((c) => c.name === 'valid_until')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN valid_until TEXT')
+    }
+    if (!memCols.some((c) => c.name === 'superseded_by')) {
+      this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT')
     }
   }
 
@@ -375,13 +405,30 @@ export class SqliteSoulStore implements SoulStore {
     return row?.created_at ?? null
   }
 
-  // ── 记忆池 + FTS5 检索 ──────────────────────────────────────────────
-  addMemory(item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt'> & { id?: string; createdAt?: string }): MemoryItem {
+  // ── 记忆池 + FTS5 检索（支持双时态 valid_until + 认知溯源 + 2 字中文并行补查）───
+  addMemory(
+    item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt' | 'provenance' | 'validFrom' | 'validUntil' | 'supersededBy'> & {
+      id?: string
+      createdAt?: string
+      provenance?: MemoryItem['provenance']
+      validFrom?: string
+      validUntil?: string | null
+      supersededBy?: string | null
+    },
+  ): MemoryItem {
     const id = item.id ?? `m_${randomUUID().slice(0, 12)}`
     const createdAt = item.createdAt ?? nowLocal()
+    const provenance: MemoryItem['provenance'] = item.provenance ?? (item.source === 'life' ? 'L2_internal' : 'L1_shared')
+    const validFrom = item.validFrom ?? createdAt
+    const validUntil = item.validUntil ?? null
+    const supersededBy = item.supersededBy ?? null
     this.db.prepare(
-      `INSERT INTO memories (id, kind, text, about_json, sensitivity, tier, disclosable, consented, source, thread_key, affect, recall_count, last_recalled_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
+      `INSERT INTO memories (
+         id, kind, text, about_json, sensitivity, tier, disclosable, consented,
+         source, provenance, valid_from, valid_until, superseded_by,
+         thread_key, affect, recall_count, last_recalled_at, created_at
+       )
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?)`,
     ).run(
       id,
       item.kind,
@@ -392,6 +439,10 @@ export class SqliteSoulStore implements SoulStore {
       item.disclosable,
       item.consented ? 1 : 0,
       item.source,
+      provenance,
+      validFrom,
+      validUntil,
+      supersededBy,
       item.threadKey,
       item.affect,
       createdAt,
@@ -399,6 +450,10 @@ export class SqliteSoulStore implements SoulStore {
     return {
       ...item,
       id,
+      provenance,
+      validFrom,
+      validUntil,
+      supersededBy,
       recallCount: 0,
       lastRecalledAt: null,
       createdAt,
@@ -406,61 +461,77 @@ export class SqliteSoulStore implements SoulStore {
   }
 
   searchMemories(query: string, limit: number): MemoryItem[] {
-    const clean = query.replace(/["'()*^:[\]{}]/g, ' ').trim()
+    const clean = query.replace(/["'()*^:[\]{}，。！？、,.!?；;：:（）()]/g, ' ').trim()
     if (!clean) return this.recentMemories(limit)
 
-    // 先走 FTS5 trigram（长度 ≥ 3 字的子串直接命中索引）
-    const tokens = clean.split(/\s+/).filter((t) => t.length >= 3).slice(0, 6)
-    const found = new Map<string, MemoryItem>()
-    if (tokens.length > 0) {
-      const ftsQuery = tokens.map((t) => `"${t.replace(/"/g, '')}"`).join(' OR ')
+    const rawTokens = clean.split(/\s+/).filter(Boolean)
+    const ftsTokens = rawTokens.filter((t) => t.length >= 3).slice(0, 6)
+    const twoCharTokens = rawTokens.filter((t) => t.length === 2).slice(0, 6)
+
+    const ftsHits: MemoryItem[] = []
+    if (ftsTokens.length > 0) {
+      const ftsQuery = ftsTokens.map((t) => `"${t.replace(/"/g, '')}"`).join(' OR ')
       try {
         const rows = this.db.prepare(
           `SELECT m.* FROM memories m
            JOIN memories_fts f ON m.rowid = f.rowid
-           WHERE memories_fts MATCH ?
+           WHERE memories_fts MATCH ? AND m.valid_until IS NULL
            ORDER BY bm25(memories_fts) ASC
            LIMIT ?`,
         ).all(ftsQuery, limit) as Array<Record<string, unknown>>
-        for (const r of rows) {
-          const item = rowToMemory(r)
-          found.set(item.id, item)
-        }
+        for (const r of rows) ftsHits.push(rowToMemory(r))
       } catch {
-        // FTS5 语法异常时回落下方 LIKE，不中断查询
+        // FTS5 语法异常时由下方 LIKE 兜底，不中断查询
       }
     }
 
-    // 短词（2 字中文词如“沙漠”“考试”）补 LIKE 检索
-    if (found.size < limit) {
-      const shortTokens = clean.split(/\s+/).filter((t) => t.length >= 2).slice(0, 4)
-      for (const tok of shortTokens) {
-        if (found.size >= limit) break
-        const rows = this.db.prepare(
-          'SELECT * FROM memories WHERE text LIKE ? ORDER BY created_at DESC LIMIT ?',
-        ).all(`%${tok}%`, limit) as Array<Record<string, unknown>>
-        for (const r of rows) {
-          const item = rowToMemory(r)
-          if (!found.has(item.id)) found.set(item.id, item)
-          if (found.size >= limit) break
-        }
-      }
+    // P0-4：只要查询包含 2 字核心词（如“咖啡”“熬夜”“考研”），无论 FTS5 是否满额都并行补查并交错融合，
+    // 绝不因 3 字弱命中把 2 字核心实词挤掉！
+    const likeHits: MemoryItem[] = []
+    const likeTokens = twoCharTokens.length > 0
+      ? twoCharTokens
+      : (ftsHits.length < limit ? rawTokens.filter((t) => t.length >= 2).slice(0, 4) : [])
+    for (const tok of likeTokens) {
+      const rows = this.db.prepare(
+        'SELECT * FROM memories WHERE valid_until IS NULL AND text LIKE ? ORDER BY created_at DESC LIMIT ?',
+      ).all(`%${tok}%`, Math.max(4, Math.ceil(limit / 2))) as Array<Record<string, unknown>>
+      for (const r of rows) likeHits.push(rowToMemory(r))
     }
 
-    return [...found.values()].slice(0, limit)
+    // 交错去重合并（2 字直接命中与 FTS5 命中轮流入选）
+    const merged = new Map<string, MemoryItem>()
+    const maxLen = Math.max(ftsHits.length, likeHits.length)
+    for (let i = 0; i < maxLen && merged.size < limit; i++) {
+      const a = likeHits[i]
+      if (a && !merged.has(a.id)) merged.set(a.id, a)
+      if (merged.size >= limit) break
+      const b = ftsHits[i]
+      if (b && !merged.has(b.id)) merged.set(b.id, b)
+    }
+
+    return [...merged.values()].slice(0, limit)
   }
 
   recentMemories(limit: number): MemoryItem[] {
-    const rows = this.db.prepare('SELECT * FROM memories ORDER BY created_at DESC, rowid DESC LIMIT ?').all(limit) as Array<Record<string, unknown>>
+    const rows = this.db.prepare(
+      'SELECT * FROM memories WHERE valid_until IS NULL ORDER BY created_at DESC, rowid DESC LIMIT ?',
+    ).all(limit) as Array<Record<string, unknown>>
     return rows.map(rowToMemory)
   }
 
   memoriesAbout(userId: string, limit: number): MemoryItem[] {
     // about_json 为 JSON 数组，精确匹配引号内 userId 避免子串误中
     const rows = this.db.prepare(
-      'SELECT * FROM memories WHERE about_json LIKE ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
+      'SELECT * FROM memories WHERE valid_until IS NULL AND about_json LIKE ? ORDER BY created_at DESC, rowid DESC LIMIT ?',
     ).all(`%"${userId}"%`, limit) as Array<Record<string, unknown>>
     return rows.map(rowToMemory)
+  }
+
+  invalidateMemory(id: string, supersededBy: string | null, at: string): boolean {
+    const info = this.db.prepare(
+      'UPDATE memories SET valid_until = ?, superseded_by = ? WHERE id = ? AND valid_until IS NULL',
+    ).run(at, supersededBy, id)
+    return Number(info.changes) > 0
   }
 
   touchMemories(ids: string[], at: string): void {
@@ -496,6 +567,7 @@ export class SqliteSoulStore implements SoulStore {
       trust: Number(r.trust),
       closeness: Number(r.closeness),
       valence: Number(r.valence),
+      disengagement: Number(r.disengagement ?? 0),
       turns: Number(r.turns),
       firstSeen: r.first_seen ? String(r.first_seen) : null,
       lastSeen: r.last_seen ? String(r.last_seen) : null,
@@ -508,11 +580,12 @@ export class SqliteSoulStore implements SoulStore {
 
   saveRelation(rec: RelationRecord): void {
     this.db.prepare(
-      `INSERT INTO relations (user_id, call_name, custom_call, type, stage, trust, closeness, valence, turns, first_seen, last_seen, feels_json, streaks_json, windows_json, tensions_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO relations (user_id, call_name, custom_call, type, stage, trust, closeness, valence, disengagement, turns, first_seen, last_seen, feels_json, streaks_json, windows_json, tensions_json)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(user_id) DO UPDATE SET
          call_name=excluded.call_name, custom_call=excluded.custom_call, type=excluded.type,
          stage=excluded.stage, trust=excluded.trust, closeness=excluded.closeness, valence=excluded.valence,
+         disengagement=excluded.disengagement,
          turns=excluded.turns, first_seen=excluded.first_seen, last_seen=excluded.last_seen,
          feels_json=excluded.feels_json, streaks_json=excluded.streaks_json, windows_json=excluded.windows_json,
          tensions_json=excluded.tensions_json`,
@@ -525,6 +598,7 @@ export class SqliteSoulStore implements SoulStore {
       rec.trust,
       rec.closeness,
       rec.valence,
+      rec.disengagement ?? 0,
       rec.turns,
       rec.firstSeen,
       rec.lastSeen,

@@ -154,6 +154,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
       workspaceDir: join(botDir, 'workspace'),
       store,
       credentials,
+      allowCreate: (ctx) => ctx.solo || (!ctx.isGroup && botCfg.access.admins.includes(ctx.userId)),
       onCredentialRequested: (name) => { lastRequestedCred = name },
     })
     if (botCfg.webSearch?.enabled !== false) {
@@ -347,7 +348,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
             ? { messageType: 'group', groupId: msg.groupId ?? undefined }
             : { messageType: 'private', userId: msg.userId }
 
-          const isAdmin = botCfg.access.admins.includes(msg.userId)
+          // P0-3：冻结会话内 tools 数组（统一 ['explore','express','create']），细粒度权限由执行层门控拦截，绝不动态删工具破 Prefix Cache
           stickers?.tickRoute(msg.threadKey)
           await soul.handleTurn({
             mode: 'chat',
@@ -360,7 +361,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
             images: opts.images,
             isGroup,
             notice: approvalNotice,
-            toolLayers: isAdmin && !isGroup ? ['explore', 'express', 'create'] : ['explore', 'express'],
+            toolLayers: ['explore', 'express', 'create'],
             maxHistoryMessages: botCfg.budget.maxHistoryMessages,
             compactDropCount: botCfg.budget.compactDropCount,
             onReply: async (reply) => {

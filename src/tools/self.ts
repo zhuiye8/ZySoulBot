@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { SoulStore } from '../shared/ports.ts'
 import { nowLocal, todayLocal } from '../shared/time.ts'
+import { trigramJaccard } from '../soul/memory/engine.ts'
 import type { DiaryBook } from '../storage/diary.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
 
@@ -51,7 +52,7 @@ export function registerSelfLifeTools(
           foldSummary: `翻了 ${date} 的日记`,
         }
       }
-      const list = deps.diary.list(2)
+      const list = deps.diary.list(1)
       if (list.length === 0) return { output: '日记本还是空的。' }
       const rendered = list.map((d) => `### ${d.date}\n${d.content.slice(0, 700)}`).join('\n\n')
       return {
@@ -78,6 +79,14 @@ export function registerSelfLifeTools(
     async execute(args, ctx) {
       const { content, date } = WriteDiaryArgsSchema.parse(args)
       const targetDate = date ?? todayLocal(ctx.now)
+      // v2.1 新颖度去重门禁：拦截与近 5 篇日记 3-gram Jaccard > 0.65 的模板化复读
+      const recent = deps.diary.list(5).filter((d) => d.date !== targetDate)
+      if (recent.some((d) => trigramJaccard(d.content, content) > 0.65)) {
+        return {
+          output: '这篇日记和前几天的写法太接近了，没有覆盖保存；如果有今天具体的新鲜事再写。',
+          foldSummary: '跳过重复日记',
+        }
+      }
       deps.diary.write(targetDate, content)
       return {
         output: `已经把 ${targetDate} 的日记写进本子里了。`,

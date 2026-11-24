@@ -127,6 +127,7 @@ function main(): void {
           trust: Number(r.trust ?? 0.35),
           closeness: Number(r.closeness ?? 0.3),
           valence: Number(r.valence ?? 0.15),
+          disengagement: 0,
           turns: Number(r.turns ?? 0),
           firstSeen: typeof r.firstSeen === 'string' ? r.firstSeen : null,
           lastSeen: typeof r.lastSeen === 'string' ? r.lastSeen : null,

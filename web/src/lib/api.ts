@@ -100,7 +100,7 @@ export interface RelationView {
   lastSeen: string | null
   lastContactAt: string | null
   sharedStories: Array<{ id: string; text: string; createdAt?: string } | string>
-  tensions?: Array<{ id: string; text: string; severity: number; createdAt: string }>
+  tensions?: Array<{ id: string; source?: 'user' | 'self'; text: string; severity: number; repeatCount?: number; createdAt: string }>
 }
 
 export interface StoredMessage {

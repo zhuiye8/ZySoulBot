@@ -13,6 +13,7 @@ export const EMOTION_KINDS = [
   'conflict',
   'sadness',
   'uneasy',
+  'guilty',
   'boredom',
   'neutral',
 ] as const
@@ -197,6 +198,7 @@ export type Sensitivity = 'open' | 'personal' | 'private' | 'critical'
 export type MemoryKind = 'experience' | 'fact' | 'concern' | 'insight'
 export type RetentionTier = 'fleeting' | 'season' | 'lasting' | 'permanent'
 export type Disclosable = 'volunteer' | 'when-asked' | 'secretive'
+export type MemoryProvenance = 'L0_external' | 'L1_shared' | 'L2_internal'
 
 export interface StoredMessage {
   id: number
@@ -220,6 +222,10 @@ export interface MemoryItem {
   disclosable: Disclosable
   consented: boolean
   source: 'private' | 'group' | 'life'
+  provenance: MemoryProvenance
+  validFrom: string
+  validUntil: string | null
+  supersededBy: string | null
   threadKey: string
   affect: AffectKind | null
   recallCount: number
@@ -231,8 +237,16 @@ export type Feel = 'better+' | 'better++' | 'worse+' | 'worse++' | 'repair' | 's
 
 export interface RelationTension {
   id: string
+  source: 'user' | 'self'
   text: string
+  topicTag: string
   severity: number // 0.2..1.0，未解心结的严重程度
+  debtTrust: number // 原始 trust 扣分绝对值（用于口头 repair 75% 债务封顶）
+  debtCloseness: number
+  debtValence: number
+  repaidRatio: number // 0..0.75
+  repeatCount: number // 14 天内同类复发次数
+  clearAirAsked?: boolean
   createdAt: string
 }
 
@@ -245,6 +259,7 @@ export interface RelationRecord {
   trust: number
   closeness: number
   valence: number
+  disengagement: number // 0..1 慢性情感抽离度
   turns: number
   firstSeen: string | null
   lastSeen: string | null
@@ -422,12 +437,22 @@ export interface SoulStore {
   compactOldMessages(threadKey: string, dropCount: number, summaryText: string): void
   lastUserContactAt(userId: string): string | null
 
-  // 记忆池 + FTS5 检索
-  addMemory(item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt'> & { id?: string; createdAt?: string }): MemoryItem
+  // 记忆池 + FTS5 检索（支持双时态 valid_until 与认知溯源 provenance）
+  addMemory(
+    item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt' | 'provenance' | 'validFrom' | 'validUntil' | 'supersededBy'> & {
+      id?: string
+      createdAt?: string
+      provenance?: MemoryProvenance
+      validFrom?: string
+      validUntil?: string | null
+      supersededBy?: string | null
+    },
+  ): MemoryItem
   searchMemories(query: string, limit: number): MemoryItem[]
   recentMemories(limit: number): MemoryItem[]
   memoriesAbout(userId: string, limit: number): MemoryItem[]
   touchMemories(ids: string[], at: string): void
+  invalidateMemory(id: string, supersededBy: string | null, at: string): boolean
   removeMemory(id: string): boolean
 
   // 关系

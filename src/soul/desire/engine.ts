@@ -14,6 +14,7 @@ import type {
 } from '../../shared/ports.ts'
 import { nowLocal, timeHHMM } from '../../shared/time.ts'
 import type { BodyEngine } from '../body/engine.ts'
+import { trigramJaccard } from '../memory/engine.ts'
 import type { PersonaPack } from '../persona/pack.ts'
 import { estimateCostCny } from '../agent/loop.ts'
 import type { PriceTable } from '../agent/loop.ts'
@@ -174,6 +175,12 @@ export class DesireEngine {
       existing.updatedAt = stamp
       this.store.upsertDesire(existing)
       return existing
+    }
+
+    // v2.1 新颖度门禁：若刚做完/淡去/放弃的近 10 条念头里已有高度相似内容（Jaccard > 0.65），拦截复读
+    const recentClosed = this.store.listDesires(['fulfilled', 'faded', 'abandoned']).slice(0, 10)
+    if (recentClosed.some((d) => trigramJaccard(d.want, want) > 0.65)) {
+      return null
     }
 
     const strength = Math.max(0.1, Math.min(1, inp.strength ?? 0.5))

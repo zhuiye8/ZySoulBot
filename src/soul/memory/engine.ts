@@ -1,11 +1,13 @@
-// 三道门记忆系统（存 / 召回+遗忘曲线+复习 / 分级与模糊披露）+ 按块滑动的对话历史窗口。
+// 三道门记忆系统（存 + 认知溯源防火墙 + 3-gram 新颖度门禁 / 召回 + 遗忘复习 + 有界情绪一致加权 / 分级模糊披露）+ 按块滑动对话窗口。
 import type {
   MemoryItem,
+  MemoryProvenance,
   RetentionTier,
   SoulStore,
   StoredMessage,
 } from '../../shared/ports.ts'
 import { nowLocal } from '../../shared/time.ts'
+import { NEGATIVE_AFFECT_KINDS } from '../body/engine.ts'
 
 export const TIER_HALFLIFE_H: Record<RetentionTier, number> = {
   fleeting: 6,
@@ -34,6 +36,26 @@ export function similarText(a: string, b: string): boolean {
   let hit = 0
   for (const ch of sy) if (sx.has(ch)) hit++
   return Math.max(hit / Math.max(1, sy.size), hit / Math.max(1, sx.size)) >= 0.58
+}
+
+// v2.1 新颖度去重度量：3-gram Jaccard 相似度（用于拦截自产 L2 日记/随想/念头的模板化复读）
+export function trigramJaccard(a: string, b: string): number {
+  const grams = (s: string): Set<string> => {
+    const clean = s.replace(/[\s，。！？、,.!?；;：:"'「」（）()~～\-—]/g, '')
+    const out = new Set<string>()
+    if (clean.length < 3) {
+      if (clean) out.add(clean)
+      return out
+    }
+    for (let i = 0; i <= clean.length - 3; i++) out.add(clean.slice(i, i + 3))
+    return out
+  }
+  const g1 = grams(a)
+  const g2 = grams(b)
+  if (g1.size === 0 || g2.size === 0) return 0
+  let inter = 0
+  for (const g of g1) if (g2.has(g)) inter++
+  return inter / (g1.size + g2.size - inter)
 }
 
 export function vagueOf(text: string, names: string[] = []): string {
@@ -96,6 +118,8 @@ function bigramOverlap(text: string, query: string): number {
   return hit / g2.size
 }
 
+const FACTUAL_QUERY_RE = /(几号|几点|哪天|地址|电话|密码|链接|网址|多少|怎么写|是什么|叫什么)/
+
 export class MemoryEngine {
   private store: SoulStore
 
@@ -104,16 +128,33 @@ export class MemoryEngine {
   }
 
   remember(
-    item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt'> & { createdAt?: string },
+    item: Omit<MemoryItem, 'id' | 'recallCount' | 'lastRecalledAt' | 'createdAt' | 'provenance' | 'validFrom' | 'validUntil' | 'supersededBy'> & {
+      createdAt?: string
+      provenance?: MemoryProvenance
+    },
   ): MemoryItem | null {
     const text = item.text.trim()
     if (!text) return null
+    const provenance: MemoryProvenance = item.provenance ?? (item.source === 'life' ? 'L2_internal' : 'L1_shared')
+
+    // P0-2 认知溯源防火墙：自产内部随想/日记/反思最高封顶 season(10d)，绝不自动升格 permanent/lasting
+    const tier: RetentionTier = provenance === 'L2_internal' && (item.tier === 'lasting' || item.tier === 'permanent')
+      ? 'season'
+      : item.tier
+
     const recent = this.store.recentMemories(40)
     if (recent.some((r) => similarText(r.text, text))) return null
-    return this.store.addMemory({ ...item, text })
+    // v2.1 新颖度去重门禁：拦截与近 10 条同类自产 L2 相似度 > 0.65 的复读机内容
+    if (provenance === 'L2_internal') {
+      const recentL2 = recent.filter((r) => r.provenance === 'L2_internal').slice(0, 10)
+      if (recentL2.some((r) => trigramJaccard(r.text, text) > 0.65)) return null
+    }
+    return this.store.addMemory({ ...item, text, tier, provenance })
   }
 
-  // 精准、紧凑地捞取本轮相关记忆（默认 Top 6 条，省 token；更细的靠她自己调 recall_memory 工具）
+  // 精准、紧凑地捞取本轮相关记忆：
+  // - P0-2 防火墙：对话召回 L2_internal 槽位硬封顶 ≤ 1 条；后台自主任务读取 L2 不累加 recallCount
+  // - v2.1 反谄媚：负向心境/带心结时对负性相关记忆给予有界情绪一致加权（≤1.3×，纯事实询问豁免）
   recallForTurn(ctx: {
     listener: string
     tier: IntimacyTier
@@ -121,11 +162,16 @@ export class MemoryEngine {
     query: string
     now: Date
     limit?: number
+    valence?: number
+    isStrained?: boolean
+    isBackground?: boolean
     nameOf: (userId: string) => string
   }): { text: string; touchedIds: string[] } {
     const limit = ctx.limit ?? 6
     const nowMs = ctx.now.getTime()
-    // FTS5 关键词召回 + 最近记忆池去重合并
+    const isFactual = FACTUAL_QUERY_RE.test(ctx.query)
+    const negativeMood = !isFactual && (Boolean(ctx.isStrained) || (ctx.valence !== undefined && ctx.valence < -0.15))
+
     const pool = new Map<string, MemoryItem>()
     for (const m of this.store.searchMemories(ctx.query, 16)) pool.set(m.id, m)
     for (const m of this.store.memoriesAbout(ctx.listener, 12)) pool.set(m.id, m)
@@ -135,14 +181,22 @@ export class MemoryEngine {
       .map((item) => {
         const strength = memoryStrength(item, nowMs)
         const rel = bigramOverlap(item.text, ctx.query)
-        const score = strength * (0.45 + 1.1 * rel)
+        let score = strength * (0.45 + 1.1 * rel)
+        // 有界情绪一致召回（上限 1.3×，防止负面螺旋；纯事实询问豁免）
+        if (negativeMood && item.affect && NEGATIVE_AFFECT_KINDS.has(item.affect)) {
+          score *= 1.25
+        }
+        // 轻微降低纯内部 L2 基础权重，保证一手外部/共享经历优先
+        if (item.provenance === 'L2_internal') score *= 0.82
         return { item, strength, score }
       })
       .sort((a, b) => b.score - a.score)
 
     const lines: string[] = []
     const touchedIds: string[] = []
+    let l2Count = 0
     for (const { item, strength } of ranked) {
+      if (item.provenance === 'L2_internal' && l2Count >= 1) continue
       const vis = visibilityOf(item, { listener: ctx.listener, tier: ctx.tier, isGroup: ctx.isGroup })
       if (vis === 'no') continue
       const aboutSelf = item.about.length === 0 || item.about.includes(ctx.listener)
@@ -152,7 +206,7 @@ export class MemoryEngine {
       if (!body) continue
 
       const day = item.createdAt.slice(0, 10)
-      // 经历类随时间淡化，事实/约定保持清晰
+      const provTag = item.provenance === 'L2_internal' ? '[随想] ' : ''
       const fuzzyTag = item.kind === 'experience' && strength < 0.35 ? '（过去有阵子了，细节记得有点模糊）' : ''
       const secretTag = item.disclosable === 'secretive' ? '（这件事你一直压在心里，还没跟谁提过）' : ''
       const ownerTag = !aboutSelf
@@ -161,8 +215,12 @@ export class MemoryEngine {
           : '（听人说起过，不涉及眼前这位）')
         : ''
 
-      lines.push(`- [${day}] ${body}${fuzzyTag}${secretTag}${ownerTag}`)
-      touchedIds.push(item.id)
+      lines.push(`- [${day}] ${provTag}${body}${fuzzyTag}${secretTag}${ownerTag}`)
+      if (item.provenance === 'L2_internal') l2Count++
+      // P0-2：后台任务读取 L2_internal 绝不累加 recallCount（切断自循环保活）
+      if (!(ctx.isBackground && item.provenance === 'L2_internal')) {
+        touchedIds.push(item.id)
+      }
       if (lines.length >= limit) break
     }
 
@@ -173,11 +231,12 @@ export class MemoryEngine {
     return { text: lines.join('\n'), touchedIds }
   }
 
-  // 捞取与某人的共同故事（关系叙事化用，2-3 条高留存经历/约定）
-  sharedStories(userId: string, limit = 3): MemoryItem[] {
+  // 捞取与某人的共同故事（关系紧绷期暂时压低温情共同故事数量，避免冲淡当下冲突现场）
+  sharedStories(userId: string, limit = 3, opts: { isStrained?: boolean } = {}): MemoryItem[] {
+    const cap = opts.isStrained ? Math.min(1, limit) : limit
     return this.store.memoriesAbout(userId, 24)
-      .filter((m) => m.kind === 'experience' || m.tier === 'lasting' || m.tier === 'permanent')
-      .slice(0, limit)
+      .filter((m) => m.provenance !== 'L2_internal' && (m.kind === 'experience' || m.tier === 'lasting' || m.tier === 'permanent'))
+      .slice(0, cap)
   }
 
   // 按块裁剪对话窗口（满 maxMessages 时一次性折叠最老 dropCount 条，保护 Prefix Cache 前缀稳定）

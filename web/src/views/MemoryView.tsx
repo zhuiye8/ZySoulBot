@@ -177,8 +177,11 @@ export function MemoryView({
                     </div>
                     {r.tensions.map((t) => (
                       <div key={t.id} className="font-voice text-xs leading-relaxed flex items-start justify-between gap-2">
-                        <span>• {t.text}</span>
-                        <span className="font-mono-num text-[10px] shrink-0" style={{ color: 'var(--danger)' }}>
+                        <span>
+                          • {t.source === 'self' ? '[愧疚] ' : ''}{t.text}
+                          {(t.repeatCount ?? 0) > 0 ? `（第 ${(t.repeatCount ?? 0) + 1} 次）` : ''}
+                        </span>
+                        <span className="font-mono-num text-[10px] shrink-0" style={{ color: t.source === 'self' ? 'var(--warn)' : 'var(--danger)' }}>
                           {Math.round(t.severity * 100)}%
                         </span>
                       </div>

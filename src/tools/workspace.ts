@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSy
 import { dirname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import { z } from 'zod'
-import type { SoulStore } from '../shared/ports.ts'
+import type { RegisteredTool, SoulStore, ToolRunContext } from '../shared/ports.ts'
 import { nowLocal } from '../shared/time.ts'
 import { CredFieldSchema } from '../soul/governance/credentials.ts'
 import type { CredentialStore } from '../soul/governance/credentials.ts'
@@ -106,6 +106,8 @@ export function registerWorkspaceTools(
     workspaceDir: string
     store: SoulStore
     credentials: CredentialStore
+    /** P0-3 执行层门控（Mask, Don't Remove）：冻结 tools 数组保 Prefix Cache，在执行时拦截非授权调用 */
+    allowCreate?: (ctx: ToolRunContext) => boolean
     onCredentialRequested?: (credName: string) => void
   },
 ): void {
@@ -113,7 +115,19 @@ export function registerWorkspaceTools(
   mkdirSync(root, { recursive: true })
   mkdirSync(join(root, 'skills'), { recursive: true })
 
-  registry.register({
+  const registerGuarded = (tool: RegisteredTool): void => {
+    registry.register({
+      ...tool,
+      async execute(args, ctx) {
+        if (deps.allowCreate && !deps.allowCreate(ctx)) {
+          return { output: '这个工作区工具仅在独处或管理员私聊里可用。', isError: true }
+        }
+        return tool.execute(args, ctx)
+      },
+    })
+  }
+
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'workspace_list',
@@ -140,7 +154,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'workspace_read',
@@ -164,7 +178,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'workspace_write',
@@ -191,7 +205,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'workspace_run',
@@ -227,7 +241,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'register_skill',
@@ -276,7 +290,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'request_credential',
@@ -318,7 +332,7 @@ export function registerWorkspaceTools(
     },
   })
 
-  registry.register({
+  registerGuarded({
     layer: 'create',
     spec: {
       name: 'read_credential',

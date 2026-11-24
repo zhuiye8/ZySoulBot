@@ -9,17 +9,38 @@ import type {
 } from '../shared/ports.ts'
 import type { PersonaPack } from '../soul/persona/pack.ts'
 
+function canonicalizeJson(val: unknown): unknown {
+  if (Array.isArray(val)) return val.map(canonicalizeJson)
+  if (val && typeof val === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(val as Record<string, unknown>).sort()) {
+      out[key] = canonicalizeJson((val as Record<string, unknown>)[key])
+    }
+    return out
+  }
+  return val
+}
+
 export class InMemoryToolRegistry implements ToolRegistry {
   private map = new Map<string, RegisteredTool>()
 
   register(tool: RegisteredTool): void {
-    this.map.set(tool.spec.name, tool)
+    const normalized: RegisteredTool = {
+      ...tool,
+      spec: {
+        ...tool.spec,
+        parameters: canonicalizeJson(tool.spec.parameters) as Record<string, unknown>,
+      },
+    }
+    this.map.set(tool.spec.name, normalized)
   }
 
+  // P0-3：按工具名严格字典序稳定输出，保证同一会话内 tools JSON 字节级冻结以保 Prefix Cache
   list(layers: ToolLayer[]): ToolSpec[] {
     const allowed = new Set(layers)
     return [...this.map.values()]
       .filter((t) => allowed.has(t.layer))
+      .sort((a, b) => a.spec.name.localeCompare(b.spec.name))
       .map((t) => t.spec)
   }
 

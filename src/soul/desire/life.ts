@@ -16,7 +16,7 @@ import { estimateCostCny } from '../agent/loop.ts'
 import type { PriceTable } from '../agent/loop.ts'
 
 export interface LifeMotive {
-  kind: 'promise' | 'missing' | 'social_desire' | 'clear_air'
+  kind: 'promise' | 'missing' | 'social_desire' | 'clear_air' | 'make_amends'
   userId: string
   fact: string
   weight: number
@@ -66,7 +66,15 @@ export function collectSocialMotives(opts: {
     lastText?: string
     stage?: string
     turns?: number
-    tensions?: Array<{ text: string; severity: number; createdAt: string }>
+    disengagement?: number
+    tensions?: Array<{
+      id?: string
+      source?: 'user' | 'self'
+      text: string
+      severity: number
+      clearAirAsked?: boolean
+      createdAt: string
+    }>
   }>
   socialDesires: DesireRecord[]
 }): LifeMotive[] {
@@ -89,14 +97,27 @@ export function collectSocialMotives(opts: {
   }
 
   for (const p of opts.people) {
+    // v2.1 反向愧疚弥补动机（即使关系未冷，做错了事也想主动补救）
+    const selfTension = p.tensions?.find((t) => t.source === 'self')
+    if (selfTension && p.stage !== 'hostile') {
+      out.push({
+        kind: 'make_amends',
+        userId: p.userId,
+        fact: `你之前有件事对${p.name}过意不去：「${selfTension.text}」，心里一直惦记着想弥补一下`,
+        weight: 0.62,
+        ref: selfTension.id,
+      })
+    }
+
     if (p.stage === 'hostile') continue
-    const topTension = p.tensions?.slice().sort((a, b) => b.severity - a.severity)[0]
+    const userTensions = (p.tensions ?? []).filter((t) => t.source !== 'self')
+    const topTension = userTensions.slice().sort((a, b) => b.severity - a.severity)[0]
     const strained = p.stage === 'distant' || (topTension !== undefined && topTension.severity >= 0.4)
 
     if (strained) {
-      // 关系冷淡或有未解心结时，不再假装没事去日常寒暄；
-      // 仅对原本相处较深（turns >= 25）且疙瘩隔了 6~72 小时的人，偶尔生出“想把话说开”的克制动机。
-      if (topTension && (p.turns ?? 0) >= 25) {
+      // 关系冷淡/带心结时不寒暄；仅在未深度情感抽离（disengagement <= 0.6）、原本相处较深、
+      // 且该心结未破冰过（!clearAirAsked）时，在 6~72 小时窗口内最多产生 1 次 clear_air 动机。
+      if (topTension && !topTension.clearAirAsked && (p.disengagement ?? 0) <= 0.6 && (p.turns ?? 0) >= 25) {
         const at = Date.parse(topTension.createdAt.replace(' ', 'T'))
         const ageH = Number.isFinite(at) ? (opts.now.getTime() - at) / 3_600_000 : 0
         if (ageH >= 6 && ageH <= 72) {
@@ -105,6 +126,7 @@ export function collectSocialMotives(opts: {
             userId: p.userId,
             fact: `你和${p.name}之间还有个没说开的疙瘩（「${topTension.text}」），心里一直有点放不下`,
             weight: 0.48,
+            ref: topTension.id,
           })
         }
       }

@@ -10,7 +10,7 @@ import type {
   TimeSlot,
   Traits,
 } from '../../shared/ports.ts'
-import { nowLocal } from '../../shared/time.ts'
+import { nowLocal, todayLocal } from '../../shared/time.ts'
 
 const clamp = (v: number, lo: number, hi: number): number => Math.max(lo, Math.min(hi, v))
 
@@ -31,6 +31,7 @@ const EFFECTS: Record<AffectKind, PAD> = {
   conflict: { p: -0.15, a: +0.12, d: +0.02 },
   sadness: { p: -0.08, a: -0.06, d: -0.03 },
   uneasy: { p: -0.07, a: +0.05, d: -0.05 },
+  guilty: { p: -0.1, a: +0.05, d: -0.06 },
   boredom: { p: -0.03, a: -0.06, d: -0.01 },
   neutral: { p: 0, a: 0, d: 0 },
 }
@@ -45,6 +46,7 @@ const DRIVE_EFFECTS: Partial<Record<AffectKind, Record<string, number>>> = {
   rejected: { companionship: -0.12 },
   conflict: { companionship: -0.14 },
   uneasy: { companionship: -0.08 },
+  guilty: { companionship: +0.06 },
   sadness: { companionship: -0.04 },
 }
 
@@ -59,6 +61,7 @@ const EVENT_VALENCE: Record<AffectKind, number> = {
   conflict: -1,
   sadness: -1,
   uneasy: -1,
+  guilty: -1,
   boredom: 0,
   neutral: 0,
 }
@@ -70,8 +73,10 @@ export const NEGATIVE_AFFECT_KINDS = new Set<AffectKind>([
   'conflict',
   'sadness',
   'uneasy',
+  'guilty',
 ])
 const PAD_KEYS = ['p', 'a', 'd'] as const
+const MAX_DAILY_INTERNAL_MOOD_DELTA = 0.05
 
 export function timeSlotOf(now: Date): TimeSlot {
   const h = now.getHours()
@@ -87,6 +92,7 @@ export class BodyEngine {
   readonly traits: Required<Traits>
   readonly baseline: PAD
   private recentNeg: Array<{ kind: AffectKind; at: number }> = []
+  private dailyInternalMoodDelta = new Map<string, number>()
 
   constructor(store: SoulStore, traits?: Traits, baseline?: PAD) {
     this.store = store
@@ -191,10 +197,20 @@ export class BodyEngine {
 
     const applied: Partial<PAD> = {}
     const moodRatio = NEGATIVE_AFFECT_KINDS.has(kind) ? 0.45 : 0.35
+    const isInternal = inp.source === 'life' || inp.source === 'desire'
+    const dayKey = todayLocal(now)
     for (const k of PAD_KEYS) {
       const before = s.pad[k]
       s.pad[k] = clamp(s.pad[k] + eff[k] * m, -1, 1)
-      s.mood[k] = clamp(s.mood[k] + eff[k] * m * moodRatio, -1, 1)
+      let moodDelta = eff[k] * m * moodRatio
+      // v2.1 反自激限幅：纯内部 L2 活动（日记/自发联想/欲望）对底色 mood.p 的单日累计改变量封顶 ±0.05
+      if (isInternal && k === 'p') {
+        const used = this.dailyInternalMoodDelta.get(dayKey) ?? 0
+        const nextUsed = clamp(used + moodDelta, -MAX_DAILY_INTERNAL_MOOD_DELTA, MAX_DAILY_INTERNAL_MOOD_DELTA)
+        moodDelta = nextUsed - used
+        this.dailyInternalMoodDelta.set(dayKey, nextUsed)
+      }
+      s.mood[k] = clamp(s.mood[k] + moodDelta, -1, 1)
       applied[k] = Number((s.pad[k] - before).toFixed(3))
     }
     const de = DRIVE_EFFECTS[kind] ?? {}

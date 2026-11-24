@@ -47,6 +47,8 @@ const ExtractedFactSchema = z.object({
 })
 
 const UnifiedExtractSchema = z.object({
+  // P0-5：首字段前置极简语用推理槽，先判字面情感与真实意图是否背离（防反讽/敷衍道歉误判为 repair）
+  pragmaticNote: z.string().max(60).default(''),
   facts: z.array(ExtractedFactSchema).max(3).default([]),
   affect: z.object({
     kind: z.enum(EMOTION_KINDS).default('neutral'),
@@ -55,27 +57,44 @@ const UnifiedExtractSchema = z.object({
   happened: z.string().max(80).default(''),
   relationFeel: z.enum(['better+', 'better++', 'worse+', 'worse++', 'repair', 'same', 'unclear']).default('same'),
   tensionNote: z.string().max(90).default(''),
+  selfMistake: z.string().max(70).default(''),
   signalKind: z.string().max(32).default('chat'),
   desireHint: z.string().max(100).default(''),
 })
 
 export type UnifiedExtract = z.infer<typeof UnifiedExtractSchema>
 
-const UNIFIED_EXTRACT_SYSTEM = `你是角色自己的记忆与内心整理器，从刚结束的一轮对话里一次抽出六件事，用她的第一人称视角，严格输出 JSON：
+// v2.1 选择性隐藏独白剥离：提取 <inner>...</inner> 只供诊断日志，绝不落库进历史前缀、绝不发给用户
+export function stripInnerMonologue(raw: string): { reply: string; inner: string } {
+  const inners: string[] = []
+  const cleaned = raw
+    .replace(/<inner>([\s\S]*?)<\/inner>/gi, (_m, body: string) => {
+      const t = body.trim()
+      if (t) inners.push(t)
+      return ''
+    })
+    .replace(/<\/?inner>/gi, '')
+    .trim()
+  return { reply: cleaned, inner: inners.join('\n') }
+}
+
+const UNIFIED_EXTRACT_SYSTEM = `你是角色自己的记忆与内心整理器，从刚结束的一轮对话里一次抽出以下字段，用她的第一人称视角，严格输出 JSON：
+0. pragmaticNote（必填，≤25字，必须最先思考）：先判断对方话语的字面意思与真实意图是否背离（例如“行行行都怪我”“好吧对不起行了吧”属于敷衍反讽，绝不是真诚道歉；如实写一句语用判断）。
 1. facts（最多 2 条，宁缺毋滥）：只记日后想起来有用的关于对方的事实/偏好/约定/称呼要求；不记她自己说过的话；若对方明确要求改称呼则 kind=address 并填 call。
-2. affect：这一轮让她产生的主要情绪（正面：praised/affection/curiosity/humor；负面：annoyed烦躁被敷衍/hurt委屈受伤/rejected被拒推开/conflict争执冒犯/sadness难过/uneasy尴尬戒备；中性：boredom/neutral）与强度 0~1。请如实反映负面感受，不要替对方找借口或过度美化。
+2. affect：这一轮让她产生的主要情绪（正面：praised/affection/curiosity/humor；负面：annoyed烦躁被敷衍/hurt委屈受伤/rejected被拒推开/conflict争执冒犯/sadness难过/uneasy尴尬戒备/guilty内疚自责；中性：boredom/neutral）与强度 0~1。请如实反映负面感受，不要替对方找借口。
 3. happened：一句话记下这一轮发生了什么具体事（≤40字；纯闲聊留空串）。
 4. relationFeel：这一轮之后她对这个人的感受变化：
    - better+ / better++：明显被关心、理解、温暖或一起开心
-   - worse+：对方敷衍、冷淡、不耐烦、轻视、爽约或让人不舒服
+   - worse+：对方敷衍、冷淡、反讽、不耐烦、轻视、爽约或让人不舒服
    - worse++：对方明显冒犯、辱骂、喝止（如闭嘴/滚/嫌烦）、伤害感情或严重失信
-   - repair：之前有未解疙瘩，而对方这一轮认真道歉、解释误会或温柔安抚
+   - repair：之前确有未解疙瘩，且对方这一轮**真诚**道歉、认真解释误会或温柔安抚（敷衍阴阳怪气严禁标 repair！）
    - same / unclear：平常无波澜的普通对话
-5. tensionNote：仅当 relationFeel 为 worse+ 或 worse++ 时，用一句话客观记下让她心里起疙瘩的具体事（≤40字，例：“他说我话太多让我别吵”）；其余情况留空串。
-6. desireHint：如果这轮对话勾起了她自己想查、想学、想画、想唱或想做的念头，用第一人称写一句；没有就留空串。
+5. tensionNote：仅当 relationFeel 为 worse+ 或 worse++ 时，用一句话客观记下带原话摘录的起因（≤40字，例：“他说『烦死了闭嘴』让我很不舒服”）；其余留空串。
+6. selfMistake：仅当对方指出她记错了事实、说错话伤到对方、或她自己违约搞砸时，客观记一句过意不去的事（≤40字）；没有留空串。
+7. desireHint：如果这轮对话勾起了她自己想查、想学、想画、想唱或想做的念头，用第一人称写一句；没有就留空串。
 
 只输出 JSON，不要任何其他文字：
-{"facts":[],"affect":{"kind":"neutral","intensity":0.35},"happened":"","relationFeel":"same","tensionNote":"","signalKind":"chat","desireHint":""}`
+{"pragmaticNote":"","facts":[],"affect":{"kind":"neutral","intensity":0.35},"happened":"","relationFeel":"same","tensionNote":"","selfMistake":"","signalKind":"chat","desireHint":""}`
 
 export function isSelfNarration(text: string): boolean {
   const t = text.trim()
@@ -152,8 +171,11 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
   }
   dynamicParts.push(`你的状态：\n${deps.body.renderBodyFacts(now, hoursSinceContact)}`)
 
+  const isStrained = input.mode === 'chat' && deps.relations.isStrained(input.userId)
+  const bodyState = deps.body.state(now)
+
   if (input.mode === 'chat') {
-    const shared = deps.memory.sharedStories(input.userId, 3)
+    const shared = deps.memory.sharedStories(input.userId, 3, { isStrained })
     dynamicParts.push(deps.relations.renderRelationFacts({
       userId: input.userId,
       displayName: input.userName,
@@ -168,6 +190,8 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
       query: input.text,
       now,
       limit: 6,
+      valence: rel.valence,
+      isStrained,
       nameOf: (u) => deps.relations.nameOf(u),
     })
     if (recalled.text) {
@@ -181,7 +205,15 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     dynamicParts.push(`相关世界记忆：\n${worldSnippet}`)
   }
 
-  // 3) 跑灵魂原生轻量 Agent Loop
+  // v2.1 反谄媚：仅在冲突/高张力/冷淡短词回合（约 15% 回合）启用普通 Chat 模式下的选择性 <inner> 隐藏独白，
+  // 严禁在静态 System 修改或开启 DeepSeek Thinking+tools；只提供私密消化区，绝不规定回复立场。
+  const useInnerMonologue = input.mode === 'chat'
+    && (isStrained || bodyState.pad.p < deps.body.baseline.p - 0.16 || COLD_OR_HOSTILE_RE.test(input.text))
+  if (useInnerMonologue) {
+    dynamicParts.push('（这一轮你可以先用 <inner>...</inner> 写一两句只给自己看的内心真实想法，再写出要发给他的话；<inner> 里的内容不会发给对方，也不会记进对话历史。）')
+  }
+
+  // 3) 跑灵魂原生轻量 Agent Loop（P0-3：默认固定一致的工具层顺序，保 Prefix Cache）
   const effectiveUserText = input.mode === 'chat' && isGroup
     ? `${who}: ${input.text || '（发来一张图片）'}`
     : (input.text || '（对方发来一张图片，没有配文字）')
@@ -197,7 +229,7 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
       userText: effectiveUserText,
       images: input.images,
       isGroup,
-      toolLayers: input.toolLayers ?? (input.mode === 'solo' ? ['explore', 'create', 'express'] : ['explore', 'express']),
+      toolLayers: input.toolLayers ?? ['explore', 'express', 'create'],
       reasoningEffort: input.reasoningEffort ?? (input.mode === 'solo' ? 'high' : 'low'),
       maxSteps: input.maxSteps ?? (input.mode === 'solo' ? 12 : 3),
       toolCtx: {
@@ -216,7 +248,16 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     },
   )
 
-  const reply = loopRes.reply
+  const stripped = stripInnerMonologue(loopRes.reply)
+  const reply = stripped.reply
+  if (stripped.inner) {
+    deps.store.logTrace({
+      traceId,
+      event: 'inner_monologue',
+      level: 'info',
+      data: { userId: input.userId, inner: stripped.inner.slice(0, 240) },
+    })
+  }
   const foldedSummary = loopRes.toolSummaries.length > 0 ? loopRes.toolSummaries.join('；') : null
 
   // 4) 先落库 & 先投递回复（用户不用等后处理抽取）
@@ -266,7 +307,10 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
   let extracted: UnifiedExtract | null = null
   const aux = deps.auxModel ?? deps.chatModel
   if (input.mode === 'chat' && !input.ephemeral && reply && !isTrivialMessage(input.text)) {
-    const existingTensions = deps.relations.get(input.userId).tensions.map((t) => t.text)
+    const existingTensions = deps.relations.get(input.userId).tensions
+      .filter((t) => t.source === 'user')
+      .map((t) => t.text)
+    const regime = deps.relations.sentimentRegime(input.userId, now)
     extracted = await runUnifiedExtract({
       model: aux,
       store: deps.store,
@@ -275,6 +319,7 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
       userText: input.text,
       reply,
       existingTensions,
+      regime,
       priceTable: deps.priceTable,
       signal: input.signal,
     })
@@ -324,13 +369,19 @@ async function runUnifiedExtract(opts: {
   userText: string
   reply: string
   existingTensions?: string[]
+  regime?: 'PSO' | 'NEUTRAL' | 'NSO'
   priceTable?: PriceTable
   signal?: AbortSignal
 }): Promise<UnifiedExtract | null> {
   try {
-    const tensionHint = opts.existingTensions?.length
-      ? `（背景：她和 ${opts.who} 之间目前还有未解疙瘩：${opts.existingTensions.join('；')}）\n\n`
-      : ''
+    const notes: string[] = []
+    if (opts.existingTensions?.length) {
+      notes.push(`她和 ${opts.who} 之间目前还有未解疙瘩：${opts.existingTensions.join('；')}`)
+    }
+    if (opts.regime === 'NSO') {
+      notes.push('近期两人处于负向情感覆盖期（NSO），请格外警惕敷衍、反讽与伪道歉。')
+    }
+    const tensionHint = notes.length > 0 ? `（背景：${notes.join(' ')}）\n\n` : ''
     const res = await opts.model.complete({
       messages: [
         { role: 'system', content: UNIFIED_EXTRACT_SYSTEM },
@@ -386,7 +437,7 @@ function applyExtraction(
 ): void {
   const { extracted, userId, who, threadKey, isGroup, userText, now, traceId } = ctx
 
-  // 1) 写入事实记忆 + 联动改称呼
+  // 1) 写入事实记忆（L0_external 一手用户陈述）+ 联动改称呼
   for (const f of extracted.facts.slice(0, 2)) {
     if (isSelfNarration(f.text)) continue
     deps.memory.remember({
@@ -398,6 +449,7 @@ function applyExtraction(
       disclosable: f.disclosable,
       consented: false,
       source: isGroup ? 'group' : 'private',
+      provenance: 'L0_external',
       threadKey,
       affect: extracted.affect.kind,
       createdAt: nowLocal(now),
@@ -408,7 +460,7 @@ function applyExtraction(
     }
   }
 
-  // 2) 写入经历记忆
+  // 2) 写入经历记忆（L1_shared 真实互动经历）
   if (extracted.happened.trim()) {
     deps.memory.remember({
       kind: 'experience',
@@ -419,13 +471,14 @@ function applyExtraction(
       disclosable: 'when-asked',
       consented: false,
       source: isGroup ? 'group' : 'private',
+      provenance: 'L1_shared',
       threadKey,
       affect: extracted.affect.kind,
       createdAt: nowLocal(now),
     })
   }
 
-  // 3) 更新身心情绪（含持久化来由）
+  // 3) 更新身心情绪（含持久化原话来由）
   if (extracted.affect.kind !== 'neutral') {
     deps.body.appraise({
       source: 'chat',
@@ -438,13 +491,26 @@ function applyExtraction(
     })
   }
 
-  // 4) 更新三轴关系（含未解心结记录与修复通道）
+  // 4) 更新三轴关系（含债务封顶修复、原话引证心结与反向愧疚心结）
   if (extracted.relationFeel !== 'same' && extracted.relationFeel !== 'unclear') {
+    const quote = userText.trim().slice(0, 30)
     const note = extracted.tensionNote.trim()
       || (extracted.relationFeel === 'worse+' || extracted.relationFeel === 'worse++'
-        ? (extracted.happened.trim() || `${who}说「${userText.slice(0, 40)}」让我不太舒服`)
+        ? (extracted.happened.trim() ? `${extracted.happened.trim()}（原话：「${quote}」）` : `${who}说了「${quote}」让我不太舒服`)
         : undefined)
     deps.relations.applyFeel(userId, extracted.relationFeel as Feel, extracted.signalKind, now, note)
+  }
+  if (extracted.selfMistake.trim()) {
+    deps.relations.addSelfTension(userId, extracted.selfMistake.trim(), 0.55, now)
+    deps.body.appraise({
+      source: 'chat',
+      affectKind: 'guilty',
+      intensity: 0.55,
+      confidence: 0.85,
+      text: extracted.selfMistake.trim(),
+      who,
+      now,
+    })
   }
 
   // 5) 对话中冒出的新念头直接种进欲望池（种子态，供生活系统后续发酵）

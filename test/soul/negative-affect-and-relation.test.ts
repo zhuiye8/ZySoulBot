@@ -62,7 +62,8 @@ test('RelationEngine enforces trust asymmetry, persists unresolved tensions, and
 
   const factsBefore = rels.renderRelationFacts({ userId: 'u1', now: t0, sharedStories: [] })
   assert.match(factsBefore, /没说开的疙瘩/)
-  assert.match(factsBefore, /让我滚/)
+  assert.match(factsBefore, /继续贬低我/)
+  assert.match(factsBefore, /第 2 次/)
 
   // 认真道歉/修复两次后，心结逐步消解、关系回暖
   rels.applyFeel('u1', 'repair', 'apology', new Date(t0.getTime() + 3_600_000))

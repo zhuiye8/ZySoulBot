@@ -413,6 +413,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         lastText: lastMsgs[0]?.content,
         stage: rel.stage,
         turns: rel.turns,
+        disengagement: rel.disengagement,
         tensions: rel.tensions,
       }
     })
@@ -487,6 +488,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         query: choice.motive.fact,
         now,
         limit: 4,
+        isBackground: true,
         nameOf: (u) => soul.relations.nameOf(u),
       })
       const text = await composeOutreach(
@@ -528,6 +530,12 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           soul.store.upsertDesire(d)
         }
       }
+      if (choice.motive.kind === 'clear_air' && choice.motive.ref) {
+        soul.relations.markClearAirAsked(uid, choice.motive.ref)
+      }
+      if (choice.motive.kind === 'make_amends' && choice.motive.ref) {
+        soul.relations.resolveSelfTension(uid, choice.motive.ref)
+      }
       soul.store.logTrace({ traceId, event: 'life_spoke', level: 'info', data: { userId: uid, kind: choice.motive.kind } })
     }
   }
@@ -558,12 +566,15 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           })
           bot.soul.body.appraise({
             source: 'life',
-            affectKind: 'sadness',
-            intensity: 0.2,
-            confidence: 0.7,
-            text: `《${work.title}》没录成功`,
+            affectKind: work.forUser ? 'guilty' : 'sadness',
+            intensity: 0.35,
+            confidence: 0.75,
+            text: `答应的歌《${work.title}》没录成功`,
             now,
           })
+          if (work.forUser) {
+            bot.soul.relations.addSelfTension(work.forUser, `答应唱的《${work.title}》录制失败没交上`, 0.45, now)
+          }
           bot.soul.store.logTrace({ traceId, event: 'song_failed', level: 'warn', data: { workId: work.id, error: res.error } })
           continue
         }
@@ -602,6 +613,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           disclosable: 'volunteer',
           consented: false,
           source: 'life',
+          provenance: 'L0_external',
           threadKey: 'life',
           affect: 'praised',
           createdAt: nowLocal(now),
