@@ -7,6 +7,19 @@ export interface DiaryEntry {
   content: string
 }
 
+// 去除正文开头重复的 `# YYYY-MM-DD` 标题，保证落盘永远只有唯一一行规范日期标题
+export function stripLeadingDateHeaders(date: string, raw: string): string {
+  const escaped = date.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  const re = new RegExp(`^(?:#+\\s*${escaped}\\s*\\r?\\n*)+`, 'i')
+  return raw.trim().replace(re, '').trim()
+}
+
+export function normalizeDiaryMarkdown(date: string, raw: string): string {
+  const body = stripLeadingDateHeaders(date, raw)
+  if (!body) return ''
+  return `# ${date}\n\n${body}`
+}
+
 export class DiaryBook {
   readonly dir: string
 
@@ -27,12 +40,13 @@ export class DiaryBook {
   read(date: string): string {
     const p = this.pathFor(date)
     if (!existsSync(p)) return ''
-    return readFileSync(p, 'utf8').trim()
+    return normalizeDiaryMarkdown(date, readFileSync(p, 'utf8'))
   }
 
   write(date: string, content: string): void {
     mkdirSync(this.dir, { recursive: true })
-    writeFileSync(this.pathFor(date), content.trim() + '\n', 'utf8')
+    const normalized = normalizeDiaryMarkdown(date, content)
+    writeFileSync(this.pathFor(date), `${normalized}\n`, 'utf8')
   }
 
   list(limit = 30): DiaryEntry[] {
@@ -42,9 +56,12 @@ export class DiaryBook {
       .sort()
       .reverse()
       .slice(0, limit)
-    return files.map((f) => ({
-      date: f.replace(/\.md$/, ''),
-      content: readFileSync(join(this.dir, f), 'utf8').trim(),
-    }))
+    return files.map((f) => {
+      const date = f.replace(/\.md$/, '')
+      return {
+        date,
+        content: normalizeDiaryMarkdown(date, readFileSync(join(this.dir, f), 'utf8')),
+      }
+    })
   }
 }

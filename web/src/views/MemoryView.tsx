@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
-import { Users, Search, Trash2, MessageSquare, Wrench } from 'lucide-react'
+import { Users, Search, Trash2, MessageSquare, Wrench, ChevronLeft, ChevronRight } from 'lucide-react'
 import { api } from '../lib/api.ts'
 import type { MemoryItem, RelationView, StoredMessage } from '../lib/api.ts'
 
@@ -34,6 +34,7 @@ export function MemoryView({
   const [tab, setTab] = useState<'people' | 'memories' | 'chat'>(validTab)
   const [relations, setRelations] = useState<RelationView[]>([])
   const [memories, setMemories] = useState<MemoryItem[]>([])
+  const [memPage, setMemPage] = useState(1)
   const [query, setQuery] = useState('')
   const [threads, setThreads] = useState<Array<{ threadKey: string; messageCount: number; lastAt: string; lastContent: string }>>([])
   const [activeThread, setActiveThread] = useState('')
@@ -56,6 +57,7 @@ export function MemoryView({
   const loadMemories = async (q = query) => {
     const m = await api.memories(botId, q)
     setMemories(m.items)
+    setMemPage(1)
   }
 
   const loadThreads = async () => {
@@ -238,41 +240,77 @@ export function MemoryView({
             <p className="text-sm font-voice py-10 text-center" style={{ color: 'var(--text-2)' }}>
               没有找到匹配的记忆。
             </p>
-          ) : (
-            <div className="space-y-2.5">
-              {memories.map((m) => {
-                const clarityPct = Math.round((m.clarity ?? 1) * 100)
-                return (
-                  <div
-                    key={m.id}
-                    className="p-3.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3"
-                    style={{ backgroundColor: 'var(--surface-2)', borderColor: 'var(--border)' }}
-                  >
-                    <div className="space-y-1.5 min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <span className="acg-pill py-0.5 text-[11px]">{TIER_LABEL[m.tier] ?? m.tier}</span>
-                        <span className="acg-pill py-0.5 text-[11px]">{m.sensitivity}</span>
-                        <span className="acg-pill py-0.5 text-[11px]">{m.kind}</span>
-                        <span className="text-[11px] font-mono-num" style={{ color: 'var(--text-2)' }}>
-                          清晰度 {clarityPct}% · 想起 {m.recallCount} 次 · {m.createdAt.slice(0, 16)}
-                        </span>
+          ) : (() => {
+            const pageSize = 10
+            const totalPages = Math.max(1, Math.ceil(memories.length / pageSize))
+            const safePage = Math.min(memPage, totalPages)
+            const slice = memories.slice((safePage - 1) * pageSize, safePage * pageSize)
+            return (
+              <div className="space-y-3">
+                <div className="space-y-2.5">
+                  {slice.map((m) => {
+                    const clarityPct = Math.round((m.clarity ?? 1) * 100)
+                    return (
+                      <div
+                        key={m.id}
+                        className="p-3.5 rounded-xl border flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+                        style={{ backgroundColor: 'var(--surface-2)', borderColor: 'var(--border)' }}
+                      >
+                        <div className="space-y-1.5 min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <span className="acg-pill py-0.5 text-[11px]">{TIER_LABEL[m.tier] ?? m.tier}</span>
+                            <span className="acg-pill py-0.5 text-[11px]">{m.sensitivity}</span>
+                            <span className="acg-pill py-0.5 text-[11px]">{m.kind}</span>
+                            <span className="text-[11px] font-mono-num" style={{ color: 'var(--text-2)' }}>
+                              清晰度 {clarityPct}% · 想起 {m.recallCount} 次 · {m.createdAt.slice(0, 16)}
+                            </span>
+                          </div>
+                          <p className="font-voice text-[14px] leading-relaxed">{m.text}</p>
+                        </div>
+                        <button
+                          type="button"
+                          aria-label="删除记忆"
+                          onClick={() => { void removeMem(m.id) }}
+                          className="acg-btn acg-btn-soft p-2 shrink-0 self-end sm:self-center"
+                          style={{ color: 'var(--danger)' }}
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
                       </div>
-                      <p className="font-voice text-[14px] leading-relaxed">{m.text}</p>
+                    )
+                  })}
+                </div>
+                {totalPages > 1 && (
+                  <div className="flex items-center justify-between pt-2 border-t text-xs" style={{ borderColor: 'var(--border)', color: 'var(--text-2)' }}>
+                    <span className="font-mono-num">
+                      显示 {(safePage - 1) * pageSize + 1}–{Math.min(safePage * pageSize, memories.length)} / 共 {memories.length} 条
+                    </span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        disabled={safePage <= 1}
+                        onClick={() => setMemPage((p) => Math.max(1, p - 1))}
+                        className="acg-btn acg-btn-soft py-1 px-2.5 text-xs disabled:opacity-40"
+                      >
+                        <ChevronLeft className="w-3.5 h-3.5" />
+                        上一页
+                      </button>
+                      <span className="font-mono-num px-2">{safePage} / {totalPages}</span>
+                      <button
+                        type="button"
+                        disabled={safePage >= totalPages}
+                        onClick={() => setMemPage((p) => Math.min(totalPages, p + 1))}
+                        className="acg-btn acg-btn-soft py-1 px-2.5 text-xs disabled:opacity-40"
+                      >
+                        下一页
+                        <ChevronRight className="w-3.5 h-3.5" />
+                      </button>
                     </div>
-                    <button
-                      type="button"
-                      aria-label="删除记忆"
-                      onClick={() => { void removeMem(m.id) }}
-                      className="acg-btn acg-btn-soft p-2 shrink-0 self-end sm:self-center"
-                      style={{ color: 'var(--danger)' }}
-                    >
-                      <Trash2 className="w-4 h-4" />
-                    </button>
                   </div>
-                )
-              })}
-            </div>
-          )}
+                )}
+              </div>
+            )
+          })()}
         </div>
       )}
 

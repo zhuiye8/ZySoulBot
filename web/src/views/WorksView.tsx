@@ -6,7 +6,19 @@ import type { StickerItem, WorkItem } from '../lib/api.ts'
 
 const EMOTIONS = ['all', 'praised', 'affection', 'humor', 'curiosity', 'annoyed', 'hurt', 'sadness', 'uneasy', 'boredom', 'rejected', 'conflict', 'neutral'] as const
 
-export function WorksView({ botId }: { botId: string }) {
+export type WorksTab = 'songs' | 'stickers' | 'tts'
+
+export function WorksView({
+  botId,
+  initialTab,
+  onTabChange,
+}: {
+  botId: string
+  initialTab?: string
+  onTabChange?: (tab: WorksTab) => void
+}) {
+  const validTab: WorksTab = initialTab === 'stickers' || initialTab === 'tts' ? initialTab : 'songs'
+  const [tab, setTab] = useState<WorksTab>(validTab)
   const [works, setWorks] = useState<WorkItem[]>([])
   const [hasSinging, setHasSinging] = useState(false)
   const [hasTts, setHasTts] = useState(false)
@@ -20,6 +32,15 @@ export function WorksView({ botId }: { botId: string }) {
 
   const [ttsText, setTtsText] = useState('你好呀，今天过得怎么样？')
   const [ttsLoading, setTtsLoading] = useState(false)
+
+  useEffect(() => {
+    setTab(validTab)
+  }, [validTab])
+
+  const switchTab = (next: WorksTab) => {
+    setTab(next)
+    onTabChange?.(next)
+  }
 
   const loadAll = async () => {
     try {
@@ -101,10 +122,34 @@ export function WorksView({ botId }: { botId: string }) {
     : stickers.filter((s) => s.emotions.includes(filterEmotion))
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <audio ref={audioRef} onEnded={() => setPlaying(false)} className="hidden" />
 
+      <div className="flex flex-wrap gap-2">
+        {[
+          { id: 'songs' as const, label: '歌单与作品', icon: Music2, count: works.length },
+          { id: 'stickers' as const, label: '表情包图库', icon: ImageIcon, count: stickers.length },
+          { id: 'tts' as const, label: '语音试听', icon: Volume2, count: null },
+        ].map((t) => {
+          const Icon = t.icon
+          const active = tab === t.id
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => switchTab(t.id)}
+              className={`acg-btn ${active ? 'acg-btn-primary' : 'acg-btn-soft'}`}
+            >
+              <Icon className="w-4 h-4" />
+              {t.label}
+              {t.count !== null && <span className="text-xs opacity-80 font-mono-num">({t.count})</span>}
+            </button>
+          )
+        })}
+      </div>
+
       {/* 1) 歌单与作品播放器（Mureka 唱歌） */}
+      {tab === 'songs' && (
       <section className="acg-card p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
@@ -189,8 +234,10 @@ export function WorksView({ botId }: { botId: string }) {
           </div>
         )}
       </section>
+      )}
 
       {/* 2) 语音试听（TTS） */}
+      {tab === 'tts' && (
       <section className="acg-card p-5 space-y-3">
         <div className="flex items-center justify-between">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
@@ -218,8 +265,10 @@ export function WorksView({ botId }: { botId: string }) {
           </button>
         </div>
       </section>
+      )}
 
       {/* 3) 表情包图库 */}
+      {tab === 'stickers' && (
       <section className="acg-card p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
@@ -304,6 +353,7 @@ export function WorksView({ botId }: { botId: string }) {
           </div>
         )}
       </section>
+      )}
     </div>
   )
 }

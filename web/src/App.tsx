@@ -173,7 +173,13 @@ export function App() {
                   onNavigate={(v) => navigateTo({ page: 'bot', botId: route.botId, view: v })}
                 />
               )}
-              {route.view === 'life' && <InnerLifeView botId={route.botId} />}
+              {route.view === 'life' && (
+                <InnerLifeView
+                  botId={route.botId}
+                  initialTab={route.tab}
+                  onTabChange={(tab) => navigateTo({ page: 'bot', botId: route.botId, view: 'life', tab }, true)}
+                />
+              )}
               {route.view === 'memory' && (
                 <MemoryView
                   botId={route.botId}
@@ -181,8 +187,20 @@ export function App() {
                   onTabChange={(tab) => navigateTo({ page: 'bot', botId: route.botId, view: 'memory', tab }, true)}
                 />
               )}
-              {route.view === 'works' && <WorksView botId={route.botId} />}
-              {route.view === 'soul' && <SoulView botId={route.botId} />}
+              {route.view === 'works' && (
+                <WorksView
+                  botId={route.botId}
+                  initialTab={route.tab}
+                  onTabChange={(tab) => navigateTo({ page: 'bot', botId: route.botId, view: 'works', tab }, true)}
+                />
+              )}
+              {route.view === 'soul' && (
+                <SoulView
+                  botId={route.botId}
+                  initialTab={route.tab}
+                  onTabChange={(tab) => navigateTo({ page: 'bot', botId: route.botId, view: 'soul', tab }, true)}
+                />
+              )}
               {route.view === 'usage' && (
                 <UsageView
                   botId={route.botId}

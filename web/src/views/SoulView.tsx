@@ -4,7 +4,19 @@ import { FileEdit, Save, KeyRound, ShieldCheck, Wrench, CheckCircle2, XCircle, T
 import { api } from '../lib/api.ts'
 import type { ApprovalRecord, CapabilityItem, PublicCredential } from '../lib/api.ts'
 
-export function SoulView({ botId }: { botId: string }) {
+export type SoulTab = 'persona' | 'credentials' | 'skills'
+
+export function SoulView({
+  botId,
+  initialTab,
+  onTabChange,
+}: {
+  botId: string
+  initialTab?: string
+  onTabChange?: (tab: SoulTab) => void
+}) {
+  const validTab: SoulTab = initialTab === 'credentials' || initialTab === 'skills' ? initialTab : 'persona'
+  const [tab, setTab] = useState<SoulTab>(validTab)
   const [personaFiles, setPersonaFiles] = useState<Record<string, string>>({})
   const [activeFile, setActiveFile] = useState('identity.md')
   const [draft, setDraft] = useState('')
@@ -15,6 +27,15 @@ export function SoulView({ botId }: { botId: string }) {
   const [credentials, setCredentials] = useState<PublicCredential[]>([])
   const [credDrafts, setCredDrafts] = useState<Record<string, Record<string, string>>>({})
   const [pendingApproval, setPendingApproval] = useState<ApprovalRecord | null>(null)
+
+  useEffect(() => {
+    setTab(validTab)
+  }, [validTab])
+
+  const switchTab = (next: SoulTab) => {
+    setTab(next)
+    onTabChange?.(next)
+  }
 
   const loadAll = async () => {
     try {
@@ -137,7 +158,32 @@ export function SoulView({ botId }: { botId: string }) {
         </section>
       )}
 
+      {/* 子页签：人设 / 外部凭证 / 本领清单 */}
+      <div className="flex flex-wrap gap-2">
+        {[
+          { id: 'persona' as const, label: '人设工作台', icon: FileEdit, count: Object.keys(personaFiles).length },
+          { id: 'credentials' as const, label: '外部凭证', icon: KeyRound, count: credentials.length },
+          { id: 'skills' as const, label: '本领清单', icon: Wrench, count: capabilities.length },
+        ].map((t) => {
+          const Icon = t.icon
+          const active = tab === t.id
+          return (
+            <button
+              key={t.id}
+              type="button"
+              onClick={() => switchTab(t.id)}
+              className={`acg-btn ${active ? 'acg-btn-primary' : 'acg-btn-soft'}`}
+            >
+              <Icon className="w-4 h-4" />
+              {t.label}
+              <span className="text-xs opacity-80 font-mono-num">({t.count})</span>
+            </button>
+          )
+        })}
+      </div>
+
       {/* 2) 外部凭证动态表单 */}
+      {tab === 'credentials' && (
       <section className="acg-card p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
@@ -216,8 +262,10 @@ export function SoulView({ botId }: { botId: string }) {
           </div>
         )}
       </section>
+      )}
 
       {/* 3) 人设包在线工作台 */}
+      {tab === 'persona' && (
       <section className="acg-card p-5 space-y-4">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
@@ -256,8 +304,10 @@ export function SoulView({ botId }: { botId: string }) {
           </button>
         </div>
       </section>
+      )}
 
       {/* 4) 已学会的本领 / Skill */}
+      {tab === 'skills' && (
       <section className="acg-card p-5 space-y-4">
         <h3 className="text-[15px] font-semibold flex items-center gap-2">
           <Wrench className="w-4 h-4" style={{ color: 'var(--accent)' }} />
@@ -302,6 +352,7 @@ export function SoulView({ botId }: { botId: string }) {
           </div>
         )}
       </section>
+      )}
     </div>
   )
 }
