@@ -11,7 +11,7 @@ import { stripInnerMonologue } from '../../src/soul/conversation/turn.ts'
 import { collectSocialMotives } from '../../src/soul/desire/life.ts'
 import { InMemoryToolRegistry } from '../../src/tools/registry.ts'
 import { registerWorkspaceTools } from '../../src/tools/workspace.ts'
-import { CredentialStore } from '../../src/soul/governance/credentials.ts'
+import { CredentialStore } from '../../src/storage/credentials-store.ts'
 
 test('P0-1: Debt-capped & repeat-decayed repair eliminates worse+apology arbitrage and triggers NSO', () => {
   const store = new SqliteSoulStore(':memory:')

@@ -56,13 +56,14 @@ function normalizeTension(raw: Partial<RelationTension>): RelationTension {
     source: raw.source === 'self' ? 'self' : 'user',
     text: String(raw.text ?? ''),
     topicTag: String(raw.topicTag ?? 'friction'),
-    severity: clamp(Number(raw.severity ?? 0.5), 0.2, 1),
+    severity: clamp(Number(raw.severity ?? 0.5), 0.18, 1),
     debtTrust: Math.max(0, Number(raw.debtTrust ?? 0.04)),
     debtCloseness: Math.max(0, Number(raw.debtCloseness ?? 0.035)),
     debtValence: Math.max(0, Number(raw.debtValence ?? 0.075)),
     repaidRatio: clamp(Number(raw.repaidRatio ?? 0), 0, ORAL_REPAIR_MAX_RATIO),
     repeatCount: Math.max(0, Number(raw.repeatCount ?? 0)),
     clearAirAsked: Boolean(raw.clearAirAsked),
+    ...(raw.lastDecayedAt ? { lastDecayedAt: String(raw.lastDecayedAt) } : {}),
     createdAt: String(raw.createdAt ?? nowLocal()),
   }
 }
@@ -178,16 +179,25 @@ export class RelationEngine {
     this.decayTensionsInPlace(r, now)
 
     const prev = r.streaks[kind]
-    const gapDays = prev ? (now.getTime() - Date.parse(prev.lastAt)) / 86_400_000 : Number.POSITIVE_INFINITY
-    const count = gapDays > STREAK_GRACE_DAYS ? 1 : (prev?.count ?? 0) + 1
+    const isPosFeel = feel === 'better+' || feel === 'better++'
+    // P1-AFF-02：正向重复折损限定在同一自然日内，跨日恢复有效额度，避免长期稳定友好互动几何饱和锁死在 hostile/NSO
+    let count: number
+    if (isPosFeel) {
+      const prevAtMs = prev ? Date.parse(prev.lastAt) : Number.NaN
+      const sameDay = Number.isFinite(prevAtMs) && todayLocal(new Date(prevAtMs)) === todayLocal(now)
+      count = sameDay ? (prev?.count ?? 0) + 1 : 1
+    } else {
+      const gapDays = prev ? (now.getTime() - Date.parse(prev.lastAt)) / 86_400_000 : Number.POSITIVE_INFINITY
+      count = gapDays > STREAK_GRACE_DAYS ? 1 : (prev?.count ?? 0) + 1
+    }
 
     if (feel === 'repair') {
-      this.applyDebtCappedRepairInPlace(r, now)
+      this.applyDebtCappedRepairInPlace(r)
     } else {
       const delta = FEEL_DELTA[feel]
       if (Object.keys(delta).length > 0) {
         r.streaks[kind] = { count, lastAt: now.toISOString() }
-        const isPos = feel === 'better+' || feel === 'better++'
+        const isPos = isPosFeel
         const isMinorNeg = feel === 'worse+'
         const isSevereNeg = feel === 'worse++'
         const streakFactor = isPos ? Math.pow(STREAK_DECAY, Math.max(0, count - 1)) : 1
@@ -199,9 +209,18 @@ export class RelationEngine {
         const appliedClose = (delta.closeness ?? 0) * streakFactor * valenceScale
         const appliedValence = (delta.valence ?? 0) * streakFactor * valenceScale
 
+        const beforeTrust = r.trust
+        const beforeClose = r.closeness
+        const beforeValence = r.valence
+
         r.trust = clamp(r.trust + appliedTrust, 0.05, 0.95)
         r.closeness = clamp(r.closeness + appliedClose, 0.05, 0.95)
         r.valence = clamp(r.valence + appliedValence, -1, 1)
+
+        // P1-AFF-01：按实际净损失记账（触底时绝不超额记债）
+        const actualLossTrust = Math.max(0, beforeTrust - r.trust)
+        const actualLossClose = Math.max(0, beforeClose - r.closeness)
+        const actualLossValence = Math.max(0, beforeValence - r.valence)
 
         if (isPos) {
           r.disengagement = clamp(r.disengagement - (feel === 'better++' ? 0.05 : 0.025), 0, 1)
@@ -218,9 +237,9 @@ export class RelationEngine {
             text: note.slice(0, 90),
             topicTag: topic,
             severity: isSevereNeg ? 0.78 : 0.42,
-            debtTrust: Math.abs(appliedTrust),
-            debtCloseness: Math.abs(appliedClose),
-            debtValence: Math.abs(appliedValence),
+            debtTrust: actualLossTrust,
+            debtCloseness: actualLossClose,
+            debtValence: actualLossValence,
             repeatCount: repeated,
             now,
           })
@@ -290,35 +309,31 @@ export class RelationEngine {
     return hits
   }
 
-  // P0-1 债务封顶 + 重复折损修复：
-  // 1) 若存在未偿清的 user 心结，口头 repair 累计最多返还原始伤害的 75%（η = 1 / (1 + 0.6 * repeatCount)）；
-  // 2) 若无任何未解心结（平白无故刷道歉），仅按极微弱 0.5x better+ 处理，绝不给暴涨。
-  private applyDebtCappedRepairInPlace(r: RelationRecord, now: Date): void {
-    const userIdx = r.tensions.findIndex((t) => t.source === 'user' && t.repaidRatio < ORAL_REPAIR_MAX_RATIO)
-    if (userIdx < 0) {
-      r.trust = clamp(r.trust + 0.004, 0.05, 0.95)
-      r.closeness = clamp(r.closeness + 0.005, 0.05, 0.95)
-      r.valence = clamp(r.valence + 0.008, -1, 1)
-      return
-    }
+  // P0-1 & P1-AFF-01 债务守恒修复：
+  // 1) 若存在未偿清的 user 心结，口头 repair 累计最多返还实际损失债务的 75%（η = 1 / (1 + 0.6 * repeatCount)）；
+  // 2) 若无任何未偿债务，repair 绝不额外加分（彻底消除“无债刷 repair”或“反复伤害+道歉”套利）。
+  private applyDebtCappedRepairInPlace(r: RelationRecord): void {
+    const userIdx = r.tensions.findIndex((t) => t.source === 'user' && t.repaidRatio < ORAL_REPAIR_MAX_RATIO - 1e-6)
+    if (userIdx < 0) return
+
     const t = { ...r.tensions[userIdx]! }
     const eta = 1 / (1 + 0.6 * t.repeatCount)
     const remainingCap = Math.max(0, ORAL_REPAIR_MAX_RATIO - t.repaidRatio)
     const stepRatio = Math.min(0.45 * eta, remainingCap)
+    if (stepRatio <= 0) return
 
     r.trust = clamp(r.trust + t.debtTrust * stepRatio, 0.05, 0.95)
     r.closeness = clamp(r.closeness + t.debtCloseness * stepRatio, 0.05, 0.95)
     r.valence = clamp(r.valence + t.debtValence * stepRatio, -1, 1)
     r.disengagement = clamp(r.disengagement - 0.06 * eta, 0, 1)
 
-    t.repaidRatio = Number((t.repaidRatio + stepRatio).toFixed(3))
-    t.severity = Number(Math.max(0, t.severity - stepRatio * 0.95).toFixed(2))
-    if (t.repaidRatio >= ORAL_REPAIR_MAX_RATIO - 0.02 || t.severity < 0.18) {
+    t.repaidRatio = Math.min(ORAL_REPAIR_MAX_RATIO, t.repaidRatio + stepRatio)
+    t.severity = Math.max(0, t.severity - stepRatio * 0.95)
+    if (ORAL_REPAIR_MAX_RATIO - t.repaidRatio <= 1e-6 || t.severity < 0.18) {
       r.tensions.splice(userIdx, 1)
     } else {
       r.tensions[userIdx] = t
     }
-    this.decayTensionsInPlace(r, now)
   }
 
   private pushTensionInPlace(
@@ -345,29 +360,35 @@ export class RelationEngine {
         || norm(inp.text).includes(norm(t.text).slice(0, 8))),
     )
     if (existing) {
+      // P1-AFF-01 债务守恒合并：只结转旧债中尚未返还的剩余可偿比例，防止清空 repaidRatio 后重复返还已偿部分
+      const remainingFraction = Math.max(0, 1 - existing.repaidRatio / ORAL_REPAIR_MAX_RATIO)
       existing.severity = clamp(Math.max(existing.severity, sev) + 0.14, 0.2, 1)
-      existing.debtTrust = Number((existing.debtTrust + inp.debtTrust).toFixed(4))
-      existing.debtCloseness = Number((existing.debtCloseness + inp.debtCloseness).toFixed(4))
-      existing.debtValence = Number((existing.debtValence + inp.debtValence).toFixed(4))
+      existing.debtTrust = existing.debtTrust * remainingFraction + inp.debtTrust
+      existing.debtCloseness = existing.debtCloseness * remainingFraction + inp.debtCloseness
+      existing.debtValence = existing.debtValence * remainingFraction + inp.debtValence
       existing.repeatCount = Math.max(existing.repeatCount + 1, inp.repeatCount)
-      existing.repaidRatio = 0 // 再次冒犯时，之前的口头哄劝失效
+      existing.repaidRatio = 0
       existing.text = inp.text
-      existing.createdAt = nowLocal(inp.now)
+      const ts = nowLocal(inp.now)
+      existing.createdAt = ts
+      existing.lastDecayedAt = ts
       return
     }
+    const ts = nowLocal(inp.now)
     const item: RelationTension = {
       id: `ten_${randomUUID().slice(0, 8)}`,
       source: inp.source,
       text: inp.text,
       topicTag: inp.topicTag,
       severity: sev,
-      debtTrust: Number(inp.debtTrust.toFixed(4)),
-      debtCloseness: Number(inp.debtCloseness.toFixed(4)),
-      debtValence: Number(inp.debtValence.toFixed(4)),
+      debtTrust: inp.debtTrust,
+      debtCloseness: inp.debtCloseness,
+      debtValence: inp.debtValence,
       repaidRatio: 0,
       repeatCount: inp.repeatCount,
       clearAirAsked: false,
-      createdAt: nowLocal(inp.now),
+      lastDecayedAt: ts,
+      createdAt: ts,
     }
     const weightOf = (t: RelationTension): number => {
       const at = Date.parse(t.createdAt.replace(' ', 'T'))
@@ -380,10 +401,11 @@ export class RelationEngine {
       .slice(0, MAX_TENSIONS)
   }
 
-  // 消除 18 天冷战死区：重度心结软化起算日随近 14 天健康互动比动态调节（健康互动多第 7 天起松动，零互动保持 21 天）
+  // P1-AFF-03 严格幂等的时间衰减：按 lastDecayedAt 仅扣减新增经过时间，满足 decay(decay(s, t), t) === decay(s, t)
   private decayTensionsInPlace(r: RelationRecord, now: Date): void {
     if (r.tensions.length === 0) return
-    const cutoff = now.getTime() - 14 * 86_400_000
+    const nowMs = now.getTime()
+    const cutoff = nowMs - 14 * 86_400_000
     let pos = 0
     let neg = 0
     for (const f of r.feels) {
@@ -394,19 +416,30 @@ export class RelationEngine {
     }
     const ratio = neg === 0 ? (pos > 0 ? 6 : 0) : pos / neg
     const heavyStartDay = ratio >= 3.0 ? 7 : ratio >= 1.5 ? 14 : 21
+    const nowStr = nowLocal(now)
 
     const kept: RelationTension[] = []
     for (const t of r.tensions) {
-      const at = Date.parse(t.createdAt.replace(' ', 'T'))
-      const ageDays = Number.isFinite(at) ? Math.max(0, (now.getTime() - at) / 86_400_000) : 0
-      if (t.severity < 0.7 && ageDays > 7) {
-        const decayed = Number((t.severity - (ageDays - 7) * 0.06).toFixed(2))
-        if (decayed >= 0.18) kept.push({ ...t, severity: decayed })
-      } else if (t.severity >= 0.7 && ageDays > heavyStartDay) {
-        const decayed = Number((t.severity - (ageDays - heavyStartDay) * 0.04).toFixed(2))
-        if (decayed >= 0.18) kept.push({ ...t, severity: decayed })
-      } else {
+      const createdMs = Date.parse(t.createdAt.replace(' ', 'T'))
+      const lastRaw = t.lastDecayedAt ?? t.createdAt
+      const lastMs = Date.parse(lastRaw.replace(' ', 'T'))
+      if (!Number.isFinite(createdMs) || !Number.isFinite(lastMs) || nowMs <= lastMs) {
         kept.push(t)
+        continue
+      }
+      const isHeavy = t.severity >= 0.7
+      const startDay = isHeavy ? heavyStartDay : 7
+      const ratePerDay = isHeavy ? 0.04 : 0.06
+      const startMs = createdMs + startDay * 86_400_000
+      const effectiveFromMs = Math.max(lastMs, startMs)
+      if (nowMs <= effectiveFromMs) {
+        kept.push({ ...t, lastDecayedAt: nowStr })
+        continue
+      }
+      const deltaDays = (nowMs - effectiveFromMs) / 86_400_000
+      const decayed = t.severity - deltaDays * ratePerDay
+      if (decayed >= 0.18) {
+        kept.push({ ...t, severity: decayed, lastDecayedAt: nowStr })
       }
     }
     r.tensions = kept

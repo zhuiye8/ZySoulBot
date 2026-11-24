@@ -1,11 +1,9 @@
-// 人设包加载器：读取 PersonaPack（pack.json + 分段 md + lore.json + activities.json）。
+// 人设包纯领域模型与静态 System Prompt 拼装器（零文件系统 I/O，I/O 加载见 src/storage/persona-loader.ts）。
 // 关键原则：渲染静态 System Prompt 时字节级锁定（严禁混入日期/轮数/剩余分钟等动态字段），保证 Prefix Cache 高命中。
-import { existsSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
 import { z } from 'zod'
 import type { ActivityDef } from '../../shared/ports.ts'
 
-const PackManifestSchema = z.object({
+export const PackManifestSchema = z.object({
   pack_version: z.string().default('1.0'),
   id: z.string().min(1),
   name: z.string().min(1),
@@ -22,14 +20,14 @@ const PackManifestSchema = z.object({
   }),
 })
 
-const LoreEntrySchema = z.object({
+export const LoreEntrySchema = z.object({
   id: z.string(),
   keys: z.array(z.string()),
   content: z.string(),
   priority: z.number().default(5),
 })
 
-const ActivityDefSchema = z.object({
+export const ActivityDefSchema = z.object({
   id: z.string().min(1),
   label: z.string().min(1),
   place: z.string().min(1),
@@ -75,9 +73,17 @@ export interface PersonaPack {
   staticSystemPrompt: string
 }
 
-function readOptionalText(filePath: string): string {
-  if (!existsSync(filePath)) return ''
-  return readFileSync(filePath, 'utf8').trim()
+export interface RawPersonaPackFiles {
+  manifestJson: string
+  identity: string
+  origin?: string
+  examples?: string
+  worldview?: string
+  scenario?: string
+  discipline?: string
+  greeting?: string
+  loreJson?: string | null
+  activitiesJson?: string | null
 }
 
 function parseWorldSections(raw: string): WorldSection[] {
@@ -112,36 +118,29 @@ export function buildStaticSystemPrompt(p: {
   return blocks.join('\n\n')
 }
 
-export function loadPersonaPack(packDir: string): PersonaPack {
-  const manifestPath = join(packDir, 'pack.json')
-  if (!existsSync(manifestPath)) {
-    throw new Error(`找不到人设包清单：${manifestPath}`)
-  }
-  const parsed = PackManifestSchema.parse(JSON.parse(readFileSync(manifestPath, 'utf8')))
-  const dir = join(packDir, parsed.content_dir)
-  const identity = readOptionalText(join(dir, parsed.content.identity))
+export function parsePersonaPack(files: RawPersonaPackFiles): PersonaPack {
+  const parsed = PackManifestSchema.parse(JSON.parse(files.manifestJson))
+  const identity = files.identity.trim()
   if (!identity) {
     throw new Error(`人设包 "${parsed.id}" 的核心身份（identity）为空，拒绝空灵魂启动`)
   }
-  const origin = parsed.content.origin ? readOptionalText(join(dir, parsed.content.origin)) : ''
-  const examples = parsed.content.examples ? readOptionalText(join(dir, parsed.content.examples)) : ''
-  const worldview = parsed.content.worldview ? readOptionalText(join(dir, parsed.content.worldview)) : ''
-  const scenario = parsed.content.scenario ? readOptionalText(join(dir, parsed.content.scenario)) : ''
-  const discipline = parsed.content.discipline ? readOptionalText(join(dir, parsed.content.discipline)) : ''
-  const greeting = parsed.content.greeting ? readOptionalText(join(dir, parsed.content.greeting)) : ''
+  const origin = (files.origin ?? '').trim()
+  const examples = (files.examples ?? '').trim()
+  const worldview = (files.worldview ?? '').trim()
+  const scenario = (files.scenario ?? '').trim()
+  const discipline = (files.discipline ?? '').trim()
+  const greeting = (files.greeting ?? '').trim()
 
   let lore: LoreEntry[] = []
-  const lorePath = join(dir, 'lore.json')
-  if (existsSync(lorePath)) {
-    const rawLore: unknown = JSON.parse(readFileSync(lorePath, 'utf8'))
+  if (files.loreJson) {
+    const rawLore: unknown = JSON.parse(files.loreJson)
     const arr = Array.isArray(rawLore) ? rawLore : (rawLore as { entries?: unknown[] })?.entries ?? []
     lore = z.array(LoreEntrySchema).parse(arr)
   }
 
   let activities: ActivityDef[] = []
-  const actPath = join(packDir, 'activities.json')
-  if (existsSync(actPath)) {
-    const rawActs: unknown = JSON.parse(readFileSync(actPath, 'utf8'))
+  if (files.activitiesJson) {
+    const rawActs: unknown = JSON.parse(files.activitiesJson)
     activities = z.array(ActivityDefSchema).parse(rawActs)
   }
 

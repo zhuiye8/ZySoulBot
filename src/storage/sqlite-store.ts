@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS body_state (
   energy REAL NOT NULL,
   sleep_debt REAL NOT NULL,
   activity_json TEXT,
+  l2_mood_day TEXT,
+  l2_mood_delta REAL NOT NULL DEFAULT 0,
   last_tick_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -141,6 +143,9 @@ CREATE TABLE IF NOT EXISTS desires (
   progress_note TEXT,
   about_user TEXT,
   parent_id TEXT,
+  last_progress_at TEXT,
+  approved_plan_version INTEGER,
+  rejected_until TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -306,6 +311,43 @@ export class SqliteSoulStore implements SoulStore {
     }
     if (!memCols.some((c) => c.name === 'superseded_by')) {
       this.db.exec('ALTER TABLE memories ADD COLUMN superseded_by TEXT')
+    }
+
+    const bodyCols = this.db.prepare('PRAGMA table_info(body_state)').all() as Array<{ name?: string }>
+    if (!bodyCols.some((c) => c.name === 'l2_mood_day')) {
+      this.db.exec('ALTER TABLE body_state ADD COLUMN l2_mood_day TEXT')
+    }
+    if (!bodyCols.some((c) => c.name === 'l2_mood_delta')) {
+      this.db.exec('ALTER TABLE body_state ADD COLUMN l2_mood_delta REAL NOT NULL DEFAULT 0')
+    }
+
+    const desireCols = this.db.prepare('PRAGMA table_info(desires)').all() as Array<{ name?: string }>
+    if (!desireCols.some((c) => c.name === 'last_progress_at')) {
+      this.db.exec('ALTER TABLE desires ADD COLUMN last_progress_at TEXT')
+    }
+    if (!desireCols.some((c) => c.name === 'approved_plan_version')) {
+      this.db.exec('ALTER TABLE desires ADD COLUMN approved_plan_version INTEGER')
+    }
+    if (!desireCols.some((c) => c.name === 'rejected_until')) {
+      this.db.exec('ALTER TABLE desires ADD COLUMN rejected_until TEXT')
+    }
+
+    // P1-MEM-01 版本化一次性迁移：旧版 source='life' 的随想/反思记忆回填为 L2_internal（不改动显式 L0_external 作品）
+    const uvRow = this.db.prepare('PRAGMA user_version').get() as { user_version?: number } | undefined
+    const userVersion = Number(uvRow?.user_version ?? 0)
+    if (userVersion < 2) {
+      this.db.exec('BEGIN')
+      try {
+        this.db.prepare(
+          `UPDATE memories SET provenance = 'L2_internal'
+           WHERE source = 'life' AND provenance = 'L1_shared'`,
+        ).run()
+        this.db.exec('PRAGMA user_version = 2')
+        this.db.exec('COMMIT')
+      } catch (e) {
+        this.db.exec('ROLLBACK')
+        throw e
+      }
     }
   }
 
@@ -487,14 +529,15 @@ export class SqliteSoulStore implements SoulStore {
 
     // P0-4：只要查询包含 2 字核心词（如“咖啡”“熬夜”“考研”），无论 FTS5 是否满额都并行补查并交错融合，
     // 绝不因 3 字弱命中把 2 字核心实词挤掉！
+    const escapeLike = (s: string): string => s.replace(/[\\%_]/g, '\\$&')
     const likeHits: MemoryItem[] = []
     const likeTokens = twoCharTokens.length > 0
       ? twoCharTokens
       : (ftsHits.length < limit ? rawTokens.filter((t) => t.length >= 2).slice(0, 4) : [])
     for (const tok of likeTokens) {
       const rows = this.db.prepare(
-        'SELECT * FROM memories WHERE valid_until IS NULL AND text LIKE ? ORDER BY created_at DESC LIMIT ?',
-      ).all(`%${tok}%`, Math.max(4, Math.ceil(limit / 2))) as Array<Record<string, unknown>>
+        "SELECT * FROM memories WHERE valid_until IS NULL AND text LIKE ? ESCAPE '\\' ORDER BY created_at DESC LIMIT ?",
+      ).all(`%${escapeLike(tok)}%`, Math.max(4, Math.ceil(limit / 2))) as Array<Record<string, unknown>>
       for (const r of rows) likeHits.push(rowToMemory(r))
     }
 
@@ -625,6 +668,8 @@ export class SqliteSoulStore implements SoulStore {
       energy: Number(r.energy),
       sleepDebt: Number(r.sleep_debt),
       activity: safeParseJson(r.activity_json, null),
+      l2MoodDay: r.l2_mood_day ? String(r.l2_mood_day) : undefined,
+      l2MoodDelta: typeof r.l2_mood_delta === 'number' ? r.l2_mood_delta : Number(r.l2_mood_delta ?? 0),
       lastTickAt: String(r.last_tick_at),
       updatedAt: String(r.updated_at),
     }
@@ -632,11 +677,12 @@ export class SqliteSoulStore implements SoulStore {
 
   saveBodyState(state: BodyState): void {
     this.db.prepare(
-      `INSERT INTO body_state (singleton, pad_json, mood_json, drives_json, energy, sleep_debt, activity_json, last_tick_at, updated_at)
-       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO body_state (singleton, pad_json, mood_json, drives_json, energy, sleep_debt, activity_json, l2_mood_day, l2_mood_delta, last_tick_at, updated_at)
+       VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(singleton) DO UPDATE SET
          pad_json=excluded.pad_json, mood_json=excluded.mood_json, drives_json=excluded.drives_json,
          energy=excluded.energy, sleep_debt=excluded.sleep_debt, activity_json=excluded.activity_json,
+         l2_mood_day=excluded.l2_mood_day, l2_mood_delta=excluded.l2_mood_delta,
          last_tick_at=excluded.last_tick_at, updated_at=excluded.updated_at`,
     ).run(
       JSON.stringify(state.pad),
@@ -645,6 +691,8 @@ export class SqliteSoulStore implements SoulStore {
       state.energy,
       state.sleepDebt,
       state.activity ? JSON.stringify(state.activity) : null,
+      state.l2MoodDay ?? null,
+      state.l2MoodDelta ?? 0,
       state.lastTickAt,
       state.updatedAt,
     )
@@ -687,18 +735,24 @@ export class SqliteSoulStore implements SoulStore {
   // ── 欲望与唯一审批 ──────────────────────────────────────────────────
   upsertDesire(d: DesireRecord): void {
     this.db.prepare(
-      `INSERT INTO desires (id, source, motive, want, why, exit_kind, stage, spec_json, blocker_json, strength, thought_count, progress_note, about_user, parent_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO desires (id, source, motive, want, why, exit_kind, stage, spec_json, blocker_json, strength, thought_count, progress_note, about_user, parent_id, last_progress_at, approved_plan_version, rejected_until, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(id) DO UPDATE SET
          motive=excluded.motive, want=excluded.want, why=excluded.why, exit_kind=excluded.exit_kind,
          stage=excluded.stage, spec_json=excluded.spec_json, blocker_json=excluded.blocker_json,
          strength=excluded.strength, thought_count=excluded.thought_count, progress_note=excluded.progress_note,
-         about_user=excluded.about_user, parent_id=excluded.parent_id, updated_at=excluded.updated_at`,
+         about_user=excluded.about_user, parent_id=excluded.parent_id,
+         last_progress_at=excluded.last_progress_at, approved_plan_version=excluded.approved_plan_version,
+         rejected_until=excluded.rejected_until, updated_at=excluded.updated_at`,
     ).run(
       d.id, d.source, d.motive, d.want, d.why, d.exitKind, d.stage,
       d.spec ? JSON.stringify(d.spec) : null,
       d.blocker ? JSON.stringify(d.blocker) : null,
-      d.strength, d.thoughtCount, d.progressNote, d.aboutUser, d.parentId, d.createdAt, d.updatedAt,
+      d.strength, d.thoughtCount, d.progressNote, d.aboutUser, d.parentId,
+      d.lastProgressAt ?? null,
+      d.approvedPlanVersion ?? null,
+      d.rejectedUntil ?? null,
+      d.createdAt, d.updatedAt,
     )
   }
 
@@ -733,6 +787,9 @@ export class SqliteSoulStore implements SoulStore {
       progressNote: r.progress_note ? String(r.progress_note) : null,
       aboutUser: r.about_user ? String(r.about_user) : null,
       parentId: r.parent_id ? String(r.parent_id) : null,
+      lastProgressAt: r.last_progress_at ? String(r.last_progress_at) : undefined,
+      approvedPlanVersion: typeof r.approved_plan_version === 'number' ? r.approved_plan_version : undefined,
+      rejectedUntil: r.rejected_until ? String(r.rejected_until) : undefined,
       createdAt: String(r.created_at),
       updatedAt: String(r.updated_at),
     }
@@ -840,6 +897,11 @@ export class SqliteSoulStore implements SoulStore {
     return list
   }
 
+  removePendingReply(id: number): boolean {
+    const info = this.db.prepare('DELETE FROM pending_replies WHERE id = ?').run(id)
+    return Number(info.changes) > 0
+  }
+
   // ── 能力与作品 ──────────────────────────────────────────────────────
   upsertCapability(cap: CapabilityRecord): void {
     this.db.prepare(
@@ -893,6 +955,26 @@ export class SqliteSoulStore implements SoulStore {
       ? 'SELECT * FROM works WHERE kind = ? ORDER BY created_at DESC LIMIT ?'
       : 'SELECT * FROM works ORDER BY created_at DESC LIMIT ?'
     const rows = (kind ? this.db.prepare(sql).all(kind, limit) : this.db.prepare(sql).all(limit)) as Array<Record<string, unknown>>
+    return rows.map((r) => ({
+      id: String(r.id),
+      kind: String(r.kind) as WorkRecord['kind'],
+      title: String(r.title),
+      content: String(r.content),
+      mediaPath: r.media_path ? String(r.media_path) : null,
+      status: String(r.status) as WorkRecord['status'],
+      externalTaskId: r.external_task_id ? String(r.external_task_id) : null,
+      forUser: r.for_user ? String(r.for_user) : null,
+      moodNote: r.mood_note ? String(r.mood_note) : null,
+      createdAt: String(r.created_at),
+    }))
+  }
+
+  listWorksByStatus(statuses: WorkRecord['status'][], limit = 20): WorkRecord[] {
+    if (statuses.length === 0) return []
+    const placeholders = statuses.map(() => '?').join(',')
+    const rows = this.db.prepare(
+      `SELECT * FROM works WHERE status IN (${placeholders}) ORDER BY created_at ASC LIMIT ?`,
+    ).all(...statuses, limit) as Array<Record<string, unknown>>
     return rows.map((r) => ({
       id: String(r.id),
       kind: String(r.kind) as WorkRecord['kind'],

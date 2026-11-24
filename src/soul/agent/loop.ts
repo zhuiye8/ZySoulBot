@@ -1,4 +1,5 @@
-// 灵魂原生轻量 Agent Loop（手脑合一 + 静前动后保 Prefix Cache + 工具脏输出回合折叠 + Token 账本）。
+// 灵魂原生轻量 Agent Loop（手脑合一 + 静前动后保 Prefix Cache + 冻结工具定义与执行期能力掩码 + 步数耗尽受限收尾）。
+import { createHash } from 'node:crypto'
 import type {
   ChatMessage,
   ChatModel,
@@ -11,6 +12,8 @@ import type {
   ToolRegistry,
   ToolRunContext,
 } from '../../shared/ports.ts'
+
+export type LoopStopReason = 'completed' | 'exhausted' | 'failed' | 'cancelled'
 
 export interface PriceTable {
   inputPerMillionCny: number
@@ -42,7 +45,10 @@ export interface AgentLoopInput {
   userText: string
   images?: ImagePart[]
   isGroup: boolean
+  /** 发给模型的冻结工具定义层（跨场景一致以保 Prefix Cache） */
   toolLayers: ToolLayer[]
+  /** P1-CACHE-01 & P2-LOOP-01：当轮实际允许执行的工具层集合（默认等于 toolLayers） */
+  allowedLayers?: ToolLayer[]
   reasoningEffort: ReasoningEffort
   temperature?: number
   maxSteps?: number
@@ -57,6 +63,8 @@ export interface AgentLoopResult {
   steps: number
   totalUsage: TokenUsage
   finishReason: string
+  stopReason: LoopStopReason
+  toolsHash: string
 }
 
 // 将历史消息渲染为稳定的前缀序列（绝不把大段工具原始返回放进历史）。
@@ -113,6 +121,9 @@ export async function runAgentLoop(deps: {
   const maxSteps = input.maxSteps ?? 4
   const maxToolChars = input.maxToolOutputChars ?? 2500
   const availableSpecs = deps.tools.list(input.toolLayers)
+  const declaredNames = new Set(availableSpecs.map((s) => s.name))
+  const execAllowedLayers = new Set(input.allowedLayers ?? input.toolLayers)
+  const toolsHash = createHash('sha256').update(JSON.stringify(availableSpecs)).digest('hex').slice(0, 12)
 
   const workingMessages = buildSandwichMessages({
     staticSystemPrompt: input.staticSystemPrompt,
@@ -134,20 +145,9 @@ export async function runAgentLoop(deps: {
   let steps = 0
   let finalReply = ''
   let lastFinish = 'stop'
+  let stopReason: LoopStopReason = 'exhausted'
 
-  while (steps < maxSteps) {
-    steps += 1
-    const res = await deps.model.complete({
-      messages: workingMessages,
-      tools: availableSpecs.length > 0 ? availableSpecs : undefined,
-      toolChoice: availableSpecs.length > 0 ? 'auto' : undefined,
-      reasoningEffort: input.reasoningEffort,
-      temperature: input.temperature ?? 0.75,
-      signal: input.signal,
-    })
-    lastFinish = res.finishReason
-
-    // 记入 Token 账本（每一步都精确入账）
+  const recordStepUsage = (res: { model: string; usage: TokenUsage }): void => {
     totalUsage.inputTokens += res.usage.inputTokens
     totalUsage.cachedTokens += res.usage.cachedTokens
     totalUsage.outputTokens += res.usage.outputTokens
@@ -162,9 +162,34 @@ export async function runAgentLoop(deps: {
       reasoningTokens: res.usage.reasoningTokens,
       estCostCny: estimateCostCny(res.usage, deps.priceTable),
     })
+  }
+
+  while (steps < maxSteps) {
+    if (input.signal?.aborted) {
+      stopReason = 'cancelled'
+      break
+    }
+    steps += 1
+    const res = await deps.model.complete({
+      messages: workingMessages,
+      tools: availableSpecs.length > 0 ? availableSpecs : undefined,
+      toolChoice: availableSpecs.length > 0 ? 'auto' : undefined,
+      reasoningEffort: input.reasoningEffort,
+      temperature: input.temperature ?? 0.75,
+      signal: input.signal,
+    })
+    lastFinish = res.finishReason
+    recordStepUsage(res)
+
+    if (res.finishReason === 'error' || res.finishReason === 'timeout') {
+      stopReason = 'failed'
+      finalReply = res.content.trim()
+      break
+    }
 
     if (res.toolCalls.length === 0) {
       finalReply = res.content.trim()
+      stopReason = 'completed'
       break
     }
 
@@ -173,14 +198,22 @@ export async function runAgentLoop(deps: {
       role: 'assistant',
       content: res.content,
       toolCalls: res.toolCalls,
+      ...(res.reasoningContent ? { reasoningContent: res.reasoningContent } : {}),
     })
 
     for (const tc of res.toolCalls) {
       const tool = deps.tools.get(tc.name)
-      if (!tool) {
-        const msg = `未知工具：${tc.name}`
+      // P2-LOOP-01：分发前同时校验“是否在本次声明的工具列表中”与“是否在当前场景执行权限内”
+      if (!tool || !declaredNames.has(tc.name)) {
+        const msg = `未知或未声明的工具：${tc.name}`
         workingMessages.push({ role: 'tool', toolCallId: tc.id, content: msg })
         deps.store.logTrace({ traceId: input.traceId, event: 'tool_missing', level: 'warn', data: { name: tc.name } })
+        continue
+      }
+      if (!execAllowedLayers.has(tool.layer)) {
+        const msg = `工具「${tc.name}」在当前场景被能力策略限制，不可执行。`
+        workingMessages.push({ role: 'tool', toolCallId: tc.id, content: msg })
+        deps.store.logTrace({ traceId: input.traceId, event: 'tool_masked', level: 'warn', data: { name: tc.name, layer: tool.layer } })
         continue
       }
       let parsedArgs: unknown = {}
@@ -219,11 +252,35 @@ export async function runAgentLoop(deps: {
     }
   }
 
+  // P1-LOOP-01：步数耗尽仍无文本收尾时，保留一次无工具受限收尾预算（保持 tools 数组不变以保前缀缓存）
+  if (stopReason === 'exhausted' && !finalReply && !input.signal?.aborted) {
+    try {
+      const wrapRes = await deps.model.complete({
+        messages: [
+          ...workingMessages,
+          { role: 'user', content: '（工具步骤已用完，请直接用简短自然的话收尾答复，不要再调用工具。）' },
+        ],
+        tools: availableSpecs.length > 0 ? availableSpecs : undefined,
+        toolChoice: availableSpecs.length > 0 ? 'none' : undefined,
+        reasoningEffort: 'low',
+        temperature: input.temperature ?? 0.7,
+        signal: input.signal,
+      })
+      recordStepUsage(wrapRes)
+      lastFinish = wrapRes.finishReason
+      finalReply = wrapRes.content.trim()
+    } catch {
+      // 收尾失败保持 exhausted
+    }
+  }
+
   return {
     reply: finalReply,
     toolSummaries,
     steps,
     totalUsage,
     finishReason: lastFinish,
+    stopReason,
+    toolsHash,
   }
 }

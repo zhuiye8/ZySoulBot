@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import type { SoulStore } from '../shared/ports.ts'
 import { nowLocal, todayLocal } from '../shared/time.ts'
+import { DesireEngine } from '../soul/desire/engine.ts'
 import { trigramJaccard } from '../soul/memory/engine.ts'
 import type { DiaryBook } from '../storage/diary.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
@@ -29,8 +30,9 @@ const NoteThoughtArgsSchema = z.object({
 
 export function registerSelfLifeTools(
   registry: InMemoryToolRegistry,
-  deps: { store: SoulStore; diary: DiaryBook },
+  deps: { store: SoulStore; diary: DiaryBook; desires?: DesireEngine },
 ): void {
+  const desires = deps.desires ?? new DesireEngine(deps.store)
   registry.register({
     layer: 'explore',
     spec: {
@@ -150,25 +152,26 @@ export function registerSelfLifeTools(
     },
     async execute(args, ctx) {
       const { want, why, exitKind } = NoteThoughtArgsSchema.parse(args)
-      const now = nowLocal(ctx.now)
-      deps.store.upsertDesire({
-        id: `d_${randomUUID().slice(0, 10)}`,
+      // P2-DES-01：统一经 DesireEngine.seed 创建念头，享受去重合并、容量上限与 3-gram 门禁
+      const seeded = desires.seed({
         source: ctx.solo ? 'diary' : 'chat',
         motive: 'curiosity',
         want,
         why,
         exitKind,
-        stage: 'active',
-        spec: null,
-        blocker: null,
         strength: 0.55,
-        thoughtCount: 1,
-        progressNote: null,
         aboutUser: ctx.solo ? null : ctx.userId,
-        parentId: null,
-        createdAt: now,
-        updatedAt: now,
+        now: ctx.now,
       })
+      if (!seeded) {
+        return {
+          output: `类似念头最近已经记过或心事本已满，先不重复记了：${want}`,
+          foldSummary: `跳过重复念头：${want.slice(0, 24)}`,
+        }
+      }
+      if (seeded.stage === 'seed') {
+        desires.save({ ...seeded, stage: 'active', lastProgressAt: nowLocal(ctx.now), updatedAt: nowLocal(ctx.now) })
+      }
       return {
         output: `已经记在心里了：${want}`,
         foldSummary: `记下念头：${want.slice(0, 30)}`,

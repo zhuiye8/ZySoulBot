@@ -21,19 +21,19 @@ import type { BodyEngine } from '../body/engine.ts'
 import { intimacyTierOf } from '../memory/engine.ts'
 import type { MemoryEngine } from '../memory/engine.ts'
 import type { RelationEngine } from '../relation/engine.ts'
+import { DesireEngine } from '../desire/engine.ts'
 import { estimateCostCny, runAgentLoop } from '../agent/loop.ts'
-import type { PriceTable } from '../agent/loop.ts'
+import type { LoopStopReason, PriceTable } from '../agent/loop.ts'
 
-// 极短无信息寒暄判据：命中则跳过后处理 LLM 抽取，直接省掉 ~40% 辅助调用。
-// 关键原则：绝不跳过冷淡/敷衍/拒绝类短词（如“哦”“随便”“滚”“闭嘴”“烦”），否则微冒犯和冷暴力会被静默吞掉！
-const COLD_OR_HOSTILE_RE = /(滚|闭嘴|别吵|别烦|烦死|好烦|懒得|随便|呵呵|无语|走开|讨厌|烦不烦|真烦|傻逼|智障|废物|别发了|^哦+[。.~…\s]*$)/i
+// 极短无信息寒暄判据：命中白名单寒暄才跳过后处理 LLM 抽取，直接省掉 ~40% 辅助调用。
+// P1-CONV-02：删除通用 `t.length <= 2` 跳过规则，确保“抱歉”“去死”“垃圾”等两字冒犯/道歉全部正常进入情绪与关系抽取！
+const COLD_OR_HOSTILE_RE = /(滚|闭嘴|别吵|别烦|烦死|好烦|懒得|随便|呵呵|无语|走开|讨厌|烦不烦|真烦|傻逼|智障|废物|去死|垃圾|别发了|^哦+[。.~…\s]*$)/i
 const TRIVIAL_RE = /^(嗯+|啊+|好+|行+|ok|好的|好呀|好哒|收到|谢谢|晚安|早安|在吗|在不在|哈哈+|嘿嘿+|笑死|确实|是的|没错|懂了|知道了|拜拜|再见|1|6+)[。！？!?~～…\s]*$/i
 
 export function isTrivialMessage(text: string): boolean {
   const t = text.trim()
   if (t.length === 0) return true
   if (COLD_OR_HOSTILE_RE.test(t)) return false
-  if (t.length <= 2 && !/[？?]/.test(t)) return true
   return TRIVIAL_RE.test(t)
 }
 
@@ -64,18 +64,43 @@ const UnifiedExtractSchema = z.object({
 
 export type UnifiedExtract = z.infer<typeof UnifiedExtractSchema>
 
-// v2.1 选择性隐藏独白剥离：提取 <inner>...</inner> 只供诊断日志，绝不落库进历史前缀、绝不发给用户
-export function stripInnerMonologue(raw: string): { reply: string; inner: string } {
-  const inners: string[] = []
-  const cleaned = raw
-    .replace(/<inner>([\s\S]*?)<\/inner>/gi, (_m, body: string) => {
-      const t = body.trim()
-      if (t) inners.push(t)
-      return ''
-    })
-    .replace(/<\/?inner>/gi, '')
-    .trim()
-  return { reply: cleaned, inner: inners.join('\n') }
+// v2.1 & P1-CONV-01 隐藏独白扫描器：严格维护 <inner> 嵌套深度，任何未闭合（如截断产生）的 <inner> 内容直接丢弃，绝不外泄！
+export function stripInnerMonologue(raw: string): { reply: string; inner: string; hadInner: boolean } {
+  const tagRe = /<(\/?)inner>/gi
+  const publicParts: string[] = []
+  const innerParts: string[] = []
+  let depth = 0
+  let lastIdx = 0
+  let hadInner = false
+
+  for (const m of raw.matchAll(tagRe)) {
+    const idx = m.index ?? 0
+    const chunk = raw.slice(lastIdx, idx)
+    if (chunk) {
+      if (depth > 0) innerParts.push(chunk)
+      else publicParts.push(chunk)
+    }
+    const isClose = m[1] === '/'
+    if (!isClose) {
+      depth += 1
+      hadInner = true
+    } else if (depth > 0) {
+      depth -= 1
+    }
+    lastIdx = idx + m[0].length
+  }
+
+  const tail = raw.slice(lastIdx)
+  if (tail) {
+    if (depth > 0) innerParts.push(tail)
+    else publicParts.push(tail)
+  }
+
+  return {
+    reply: publicParts.join('').trim(),
+    inner: innerParts.map((s) => s.trim()).filter(Boolean).join('\n'),
+    hadInner,
+  }
 }
 
 const UNIFIED_EXTRACT_SYSTEM = `你是角色自己的记忆与内心整理器，从刚结束的一轮对话里一次抽出以下字段，用她的第一人称视角，严格输出 JSON：
@@ -114,6 +139,8 @@ export interface TurnInput {
   images?: ImagePart[]
   isGroup?: boolean
   toolLayers?: ToolLayer[]
+  /** P1-CACHE-01：当轮实际允许执行的工具层（与冻结的 toolLayers 分离） */
+  allowedLayers?: ToolLayer[]
   reasoningEffort?: ReasoningEffort
   maxSteps?: number
   ephemeral?: boolean
@@ -129,6 +156,10 @@ export interface TurnOutput {
   reply: string
   toolSummaries: string[]
   steps: number
+  stopReason: LoopStopReason
+  toolsHash: string
+  /** P1-STATE-02：明确反馈 onReply 投递是否成功，供待回复队列按 ACK 语义删除 */
+  delivered: boolean
   extracted: UnifiedExtract | null
 }
 
@@ -138,6 +169,7 @@ export interface ConversationDeps {
   body: BodyEngine
   memory: MemoryEngine
   relations: RelationEngine
+  desires?: DesireEngine
   chatModel: ChatModel
   auxModel?: ChatModel | null
   tools: ToolRegistry
@@ -175,7 +207,13 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
   const bodyState = deps.body.state(now)
 
   if (input.mode === 'chat') {
-    const shared = deps.memory.sharedStories(input.userId, 3, { isStrained })
+    const tier = intimacyTierOf(rel.stage)
+    const shared = deps.memory.sharedStories(input.userId, 3, {
+      isStrained,
+      isGroup,
+      listener: input.userId,
+      tier,
+    })
     dynamicParts.push(deps.relations.renderRelationFacts({
       userId: input.userId,
       displayName: input.userName,
@@ -185,7 +223,7 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     }))
     const recalled = deps.memory.recallForTurn({
       listener: input.userId,
-      tier: intimacyTierOf(rel.stage),
+      tier,
       isGroup,
       query: input.text,
       now,
@@ -230,6 +268,7 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
       images: input.images,
       isGroup,
       toolLayers: input.toolLayers ?? ['explore', 'express', 'create'],
+      allowedLayers: input.allowedLayers,
       reasoningEffort: input.reasoningEffort ?? (input.mode === 'solo' ? 'high' : 'low'),
       maxSteps: input.maxSteps ?? (input.mode === 'solo' ? 12 : 3),
       toolCtx: {
@@ -249,7 +288,7 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
   )
 
   const stripped = stripInnerMonologue(loopRes.reply)
-  const reply = stripped.reply
+  let reply = stripped.reply
   if (stripped.inner) {
     deps.store.logTrace({
       traceId,
@@ -257,6 +296,25 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
       level: 'info',
       data: { userId: input.userId, inner: stripped.inner.slice(0, 240) },
     })
+  }
+  // P1-CONV-01：若整条输出全被包在 <inner> 里（含截断未闭合）导致公开正文为空，做一次受限收尾，绝不恢复原始独白
+  if (!reply && stripped.hadInner && input.mode === 'chat' && !input.signal?.aborted) {
+    try {
+      const wrap = await deps.chatModel.complete({
+        messages: [
+          { role: 'system', content: deps.persona.staticSystemPrompt },
+          { role: 'user', content: `${effectiveUserText}\n\n（请直接说出要回复给对方的话，不要使用 <inner> 标签。）` },
+        ],
+        reasoningEffort: 'low',
+        temperature: 0.7,
+        maxTokens: 160,
+        signal: input.signal,
+      })
+      const cleanedWrap = stripInnerMonologue(wrap.content).reply
+      if (cleanedWrap) reply = cleanedWrap
+    } catch {
+      // 收尾失败保持静默，绝不泄露 inner
+    }
   }
   const foldedSummary = loopRes.toolSummaries.length > 0 ? loopRes.toolSummaries.join('；') : null
 
@@ -290,10 +348,13 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
   // 真实消耗一点精力（独处重活消耗更多）
   deps.body.spendEnergy(input.mode === 'solo' ? 0.04 : 0.015, now)
 
+  let delivered = !input.onReply
   if (reply && input.onReply) {
     try {
       await input.onReply(reply)
+      delivered = true
     } catch (e) {
+      delivered = false
       deps.store.logTrace({
         traceId,
         event: 'reply_deliver_error',
@@ -344,6 +405,9 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     data: {
       mode: input.mode,
       steps: loopRes.steps,
+      stopReason: loopRes.stopReason,
+      toolsHash: loopRes.toolsHash,
+      delivered,
       tools: loopRes.toolSummaries.length,
       inputTokens: loopRes.totalUsage.inputTokens,
       cachedTokens: loopRes.totalUsage.cachedTokens,
@@ -357,6 +421,9 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     reply,
     toolSummaries: loopRes.toolSummaries,
     steps: loopRes.steps,
+    stopReason: loopRes.stopReason,
+    toolsHash: loopRes.toolsHash,
+    delivered,
     extracted,
   }
 }
@@ -513,25 +580,18 @@ function applyExtraction(
     })
   }
 
-  // 5) 对话中冒出的新念头直接种进欲望池（种子态，供生活系统后续发酵）
+  // 5) P2-DES-01：对话中冒出的新念头统一经过 DesireEngine.seed（享受去重、容量上限与 3-gram 门禁）
   if (extracted.desireHint.trim()) {
-    deps.store.upsertDesire({
-      id: `d_${randomUUID().slice(0, 10)}`,
+    const desireEngine = deps.desires ?? new DesireEngine(deps.store)
+    desireEngine.seed({
       source: 'chat',
       motive: 'curiosity',
       want: extracted.desireHint.trim(),
       why: `和${who}聊起「${userText.slice(0, 30)}」时冒出来的念头`,
       exitKind: 'experience',
-      stage: 'seed',
-      spec: null,
-      blocker: null,
-      strength: 0.45,
-      thoughtCount: 1,
-      progressNote: null,
       aboutUser: userId,
-      parentId: null,
-      createdAt: nowLocal(now),
-      updatedAt: nowLocal(now),
+      strength: 0.45,
+      now,
     })
   }
 }

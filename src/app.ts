@@ -18,12 +18,12 @@ import { nowLocal, systemClock } from './shared/time.ts'
 import type { Clock } from './shared/time.ts'
 import { SqliteSoulStore } from './storage/sqlite-store.ts'
 import { DiaryBook } from './storage/diary.ts'
-import { loadPersonaPack } from './soul/persona/pack.ts'
+import { loadPersonaPack } from './storage/persona-loader.ts'
+import { StickerLibrary } from './storage/sticker-store.ts'
+import { CredentialStore } from './storage/credentials-store.ts'
 import { Soul } from './soul/index.ts'
 import { decideAttention } from './soul/conversation/attention.ts'
 import { decideGroupChime, decideShouldWait, GroupPresence } from './soul/conversation/group.ts'
-import { StickerLibrary } from './soul/expression/stickers.ts'
-import { CredentialStore } from './soul/governance/credentials.ts'
 import { isApprovalGranted, isApprovalRejected } from './soul/governance/approval.ts'
 import { createOpenAIChatModel } from './llm/openai-chat.ts'
 import { createAsrAdapter } from './llm/asr.ts'
@@ -155,6 +155,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
       store,
       credentials,
       allowCreate: (ctx) => ctx.solo || (!ctx.isGroup && botCfg.access.admins.includes(ctx.userId)),
+      allowUnsafeLocalExec: botCfg.proactivity.allowUnsafeLocalExec,
       onCredentialRequested: (name) => { lastRequestedCred = name },
     })
     if (botCfg.webSearch?.enabled !== false) {
@@ -254,10 +255,14 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
         soul.approvals.resolve(pending, 'approved', now)
         const d = store.getDesire(pending.targetId)
         if (d) {
+          const stamp = nowLocal(now)
           d.stage = 'active'
           d.blocker = null
+          d.approvedPlanVersion = (d.approvedPlanVersion ?? 0) + 1
+          d.rejectedUntil = undefined
           d.progressNote = '管理员已经点头同意了'
-          d.updatedAt = nowLocal(now)
+          d.lastProgressAt = stamp
+          d.updatedAt = stamp
           store.upsertDesire(d)
         }
         return `刚才你提的请求「${pending.what}」，他答应了。`
@@ -266,8 +271,13 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
         soul.approvals.resolve(pending, 'rejected', now)
         const d = store.getDesire(pending.targetId)
         if (d) {
-          d.progressNote = '这次他没答应'
-          d.updatedAt = nowLocal(now)
+          const stamp = nowLocal(now)
+          d.stage = 'active'
+          d.blocker = null
+          d.rejectedUntil = nowLocal(new Date(now.getTime() + 24 * 3_600_000))
+          d.progressNote = '这次他没答应，先搁置一段时间'
+          d.lastProgressAt = stamp
+          d.updatedAt = stamp
           store.upsertDesire(d)
         }
         return `刚才你提的请求「${pending.what}」，他这次没答应。`
@@ -558,45 +568,34 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
   const adminAuthPath = deps.adminAuthFilePath
     ?? resolve(bots[0]?.botDir ? join(bots[0].botDir, '..', 'admin-auth.json') : join(process.cwd(), 'data', 'admin-auth.json'))
 
+  const toAdminBot = (b: BotRuntime) => ({
+    config: b.config,
+    botDir: b.botDir,
+    personaDir: b.personaDir,
+    soul: b.soul,
+    diary: b.diary,
+    credentials: b.credentials,
+    stickers: b.stickers,
+    tts: b.tts,
+    singing: b.singing,
+    transport: b.transport,
+    reloadPersona: () => {
+      b.soul.persona = loadPersonaPack(b.personaDir)
+    },
+    runSerialized: <T>(fn: () => Promise<T> | T): Promise<T> => queue.enqueue(b.config.id, async () => fn()),
+  })
+
   const admin: AdminAppBundle | null = config.admin
     ? createAdminApp({
-      bots: bots.map((b) => ({
-        config: b.config,
-        botDir: b.botDir,
-        personaDir: b.personaDir,
-        soul: b.soul,
-        diary: b.diary,
-        credentials: b.credentials,
-        stickers: b.stickers,
-        tts: b.tts,
-        singing: b.singing,
-        transport: b.transport,
-        reloadPersona: () => {
-          b.soul.persona = loadPersonaPack(b.personaDir)
-        },
-      })),
+      bots: bots.map(toAdminBot),
       authFilePath: adminAuthPath,
       webDistDir: deps.adminWebDistDir,
       initialPassword: deps.adminInitialPassword ?? process.env.ZYSOUL_ADMIN_PASSWORD,
+      trustProxy: config.admin.trustProxy,
       clock,
       getBot: (id) => {
         const b = bots.find((x) => x.config.id === id)
-        if (!b) return undefined
-        return {
-          config: b.config,
-          botDir: b.botDir,
-          personaDir: b.personaDir,
-          soul: b.soul,
-          diary: b.diary,
-          credentials: b.credentials,
-          stickers: b.stickers,
-          tts: b.tts,
-          singing: b.singing,
-          transport: b.transport,
-          reloadPersona: () => {
-            b.soul.persona = loadPersonaPack(b.personaDir)
-          },
-        }
+        return b ? toAdminBot(b) : undefined
       },
     })
     : null
@@ -614,8 +613,8 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
       }
       if (admin && config.admin && deps.listenAdmin !== false) {
         adminServer = startAdminServer(admin, { host: config.admin.host, port: config.admin.port })
-        if (admin.auth.generatedPassword) {
-          console.log(`[zySoulbot] Admin initial password generated and saved to ${admin.auth.filePath}`)
+        if (admin.auth.generatedPassword && admin.auth.initialPasswordFilePath) {
+          console.log(`[ZySoulBot] 首次随机管理员口令已写入受限文件（0600）：${admin.auth.initialPasswordFilePath}（登录改密后将自动销毁）`)
         }
       }
       rhythm.start()

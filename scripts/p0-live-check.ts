@@ -1,8 +1,9 @@
 // P0 真网关端到端验证（纯内存 soul.db，完全隔离，不碰线上与磁盘数据）。
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { SqliteSoulStore } from '../src/storage/sqlite-store.ts'
-import { loadPersonaPack } from '../src/soul/persona/pack.ts'
+import { loadPersonaPack } from '../src/storage/persona-loader.ts'
 import { Soul } from '../src/soul/index.ts'
 import { createOpenAIChatModel } from '../src/llm/openai-chat.ts'
 import { InMemoryToolRegistry, registerSelfExplorationTools } from '../src/tools/registry.ts'
@@ -23,7 +24,7 @@ function loadGateway(): { baseUrl: string; apiKey: string; model: string } {
 async function main(): Promise<void> {
   const gw = loadGateway()
   const store = new SqliteSoulStore(':memory:')
-  const persona = loadPersonaPack(resolve('c:/Files/work/qq-bot/zySoulbot/personas/nahida'))
+  const persona = loadPersonaPack(fileURLToPath(new URL('../personas/nahida', import.meta.url)))
   const model = createOpenAIChatModel({ baseUrl: gw.baseUrl, apiKey: gw.apiKey, model: gw.model })
   const tools = new InMemoryToolRegistry()
   registerSelfExplorationTools(tools, { store, persona })

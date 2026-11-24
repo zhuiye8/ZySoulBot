@@ -2,7 +2,7 @@
 // - 粗 tick（默认 5 分钟，纯代码零 token；命中条件才调模型）：身心演化 → 活动收尾与回过神回复 → 凭证唤醒 → 欲望演化与成型 → 确定性授权/凭证提醒 → 日记/反思/自发联想 → 统一生活决策与推进念头
 // - 细 tick（默认 1 分钟）：精确提醒履约
 import { randomUUID } from 'node:crypto'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { BotConfig } from './shared/config.ts'
 import type { DesireRecord, SendTarget, SingingPort, TransportPort } from './shared/ports.ts'
@@ -51,6 +51,50 @@ export interface RhythmOptions {
   wanderProbability?: number
   clock?: Clock
   random?: () => number
+  onError?: (botId: string, phase: string, err: unknown) => void
+}
+
+const MAX_SONG_BYTES = 25 * 1024 * 1024
+
+// P1-SEC-04：流式下载字节预算，避免大响应先 arrayBuffer() 撑爆内存
+async function downloadBytesBounded(res: Response, maxBytes: number): Promise<Uint8Array> {
+  const cl = Number(res.headers.get('content-length') ?? '')
+  if (Number.isFinite(cl) && cl > maxBytes) {
+    throw new Error(`song content-length ${cl} exceeds ${maxBytes}`)
+  }
+  if (!res.body) {
+    const bytes = new Uint8Array(await res.arrayBuffer())
+    if (bytes.byteLength === 0 || bytes.byteLength > maxBytes) {
+      throw new Error(`invalid song size ${bytes.byteLength}`)
+    }
+    return bytes
+  }
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {})
+        throw new Error(`song stream exceeded ${maxBytes} bytes`)
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  if (total === 0) throw new Error('empty song response')
+  const merged = new Uint8Array(total)
+  let offset = 0
+  for (const c of chunks) {
+    merged.set(c, offset)
+    offset += c.byteLength
+  }
+  return merged
 }
 
 export interface RhythmHandle {
@@ -74,6 +118,24 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
   let startedAt = 0
   const lastActMs = new Map<string, number>()
   const reflectedOnDay = new Map<string, string>()
+  const inFlightDesires = new Set<string>()
+
+  const reportError = (bot: RhythmBot | null, phase: string, err: unknown): void => {
+    const msg = err instanceof Error ? err.message : String(err)
+    if (bot) {
+      try {
+        bot.soul.store.logTrace({
+          traceId: `${phase}_${randomUUID().slice(0, 6)}`,
+          event: `${phase}_error`,
+          level: 'error',
+          data: { error: msg.slice(0, 200) },
+        })
+      } catch {
+        // 避免日志异常二次抛错
+      }
+    }
+    opts.onError?.(bot?.config.id ?? 'rhythm', phase, err)
+  }
 
   const targetOf = (threadKey: string, userId: string): SendTarget => {
     if (threadKey.startsWith('qq:group:')) {
@@ -99,20 +161,22 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
     const { soul, config } = bot
     const admin = config.access.admins[0] ?? config.proactivity.allowlist[0] ?? ''
 
-    // 若是造技能：先过代码硬安全门（注意：缺凭证允许进入，且显式提示她调 request_credential）
+    // 若是造技能：先过代码硬安全门（注意：缺凭证允许进入；已获单次人工批准则放行；拒绝冷却期直接跳过）
     let needsCredentialHint = false
     if (desire.exitKind === 'build_skill') {
-      const scope = checkBuildScope(desire, { autonomyEnabled: config.proactivity.autonomyBuildEnabled })
+      const scope = checkBuildScope(desire, { autonomyEnabled: config.proactivity.autonomyBuildEnabled, now })
       if (!scope.allowed) {
         if (scope.hardBlocked) {
           desire.stage = 'abandoned'
           desire.progressNote = `触碰硬边界（${scope.reason}），放弃自己动手`
+          desire.lastProgressAt = nowLocal(now)
           desire.updatedAt = nowLocal(now)
           soul.store.upsertDesire(desire)
           soul.store.logTrace({ traceId, event: 'desire_hard_blocked', level: 'info', data: { desireId: desire.id, reason: scope.reason } })
         } else if (scope.needsApproval) {
           desire.stage = 'waiting_approval'
           desire.blocker = { kind: 'approval', what: `我想自己动手做「${desire.want}」，需要你点个头允许` }
+          desire.lastProgressAt = nowLocal(now)
           desire.updatedAt = nowLocal(now)
           soul.store.upsertDesire(desire)
           soul.store.logTrace({ traceId, event: 'desire_needs_approval', level: 'info', data: { desireId: desire.id, reason: scope.reason } })
@@ -123,8 +187,10 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
     }
 
     desire.stage = 'in_progress'
+    desire.lastProgressAt = nowLocal(now)
     desire.updatedAt = nowLocal(now)
     soul.store.upsertDesire(desire)
+    inFlightDesires.add(desire.id)
     bot.takeRequestedCredential() // 清空旧标记
 
     const specNote = desire.spec
@@ -145,26 +211,47 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         userId: admin || bot.config.id,
         userName: admin ? soul.relations.nameOf(admin) : soul.persona.name,
         text: prompt,
-        toolLayers: ['explore', 'create', 'express'],
+        toolLayers: ['explore', 'express', 'create'],
         reasoningEffort: desire.exitKind === 'build_skill' ? 'high' : 'low',
         maxSteps: desire.exitKind === 'build_skill' ? 14 : 6,
       })
 
-      const requestedCred = bot.takeRequestedCredential()
-      if (requestedCred && !bot.credentials.isReady(requestedCred)) {
-        desire.stage = 'waiting_credential'
-        desire.blocker = { kind: 'credential', what: `等后台填写凭证「${requestedCred}」`, payload: { credName: requestedCred } }
-        desire.progressNote = `已登记需要「${requestedCred}」凭证，等填好再继续`
-        desire.updatedAt = nowLocal(now)
-        soul.store.upsertDesire(desire)
-        soul.store.logTrace({ traceId, event: 'desire_waiting_credential', level: 'info', data: { desireId: desire.id, credName: requestedCred } })
+      // P1-STATE-04：跨 await 回写前重新读取最新状态，若期间已被管理员放弃/变更则绝不覆盖为 fulfilled
+      const latest = soul.store.getDesire(desire.id)
+      if (!latest || latest.stage === 'abandoned' || latest.stage === 'faded') {
+        soul.store.logTrace({ traceId, event: 'desire_cancelled_in_flight', level: 'info', data: { desireId: desire.id, stage: latest?.stage ?? 'missing' } })
         return
       }
 
-      desire.stage = 'fulfilled'
-      desire.progressNote = (out.reply || out.toolSummaries.join('；') || '完成了').slice(0, 180)
-      desire.updatedAt = nowLocal(now)
-      soul.store.upsertDesire(desire)
+      const requestedCred = bot.takeRequestedCredential()
+      if (requestedCred && !bot.credentials.isReady(requestedCred)) {
+        latest.stage = 'waiting_credential'
+        latest.blocker = { kind: 'credential', what: `等后台填写凭证「${requestedCred}」`, payload: { credName: requestedCred } }
+        latest.progressNote = `已登记需要「${requestedCred}」凭证，等填好再继续`
+        latest.lastProgressAt = nowLocal(now)
+        latest.updatedAt = nowLocal(now)
+        soul.store.upsertDesire(latest)
+        soul.store.logTrace({ traceId, event: 'desire_waiting_credential', level: 'info', data: { desireId: latest.id, credName: requestedCred } })
+        return
+      }
+
+      // P1-LOOP-01：步数耗尽/失败/取消绝不误判 fulfilled，保留 active 以便后续继续推进
+      if (out.stopReason !== 'completed') {
+        latest.stage = 'active'
+        latest.progressNote = `本轮未完全收口（${out.stopReason}）：${(out.reply || out.toolSummaries.join('；') || '稍后继续').slice(0, 140)}`
+        latest.lastProgressAt = nowLocal(now)
+        latest.updatedAt = nowLocal(now)
+        soul.store.upsertDesire(latest)
+        soul.store.logTrace({ traceId, event: 'desire_incomplete', level: 'warn', data: { desireId: latest.id, stopReason: out.stopReason, steps: out.steps } })
+        return
+      }
+
+      latest.stage = 'fulfilled'
+      latest.approvedPlanVersion = undefined
+      latest.progressNote = (out.reply || out.toolSummaries.join('；') || '完成了').slice(0, 180)
+      latest.lastProgressAt = nowLocal(now)
+      latest.updatedAt = nowLocal(now)
+      soul.store.upsertDesire(latest)
 
       // 真实情绪与记忆闭环：做完心里惦记的事会雀跃，也会进记忆
       soul.body.appraise({
@@ -172,12 +259,12 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         affectKind: 'praised',
         intensity: 0.45,
         confidence: 0.85,
-        text: `把心里想做的事推进完了：${desire.want}`,
+        text: `把心里想做的事推进完了：${latest.want}`,
         now,
       })
       soul.memory.remember({
         kind: 'experience',
-        text: `我自己推进了「${desire.want}」：${desire.progressNote}`,
+        text: `我自己推进了「${latest.want}」：${latest.progressNote}`,
         about: [],
         sensitivity: 'open',
         tier: 'season',
@@ -190,16 +277,24 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
       })
 
       // 造出新东西时，若配置了管理员且回复不为空，轻声告诉他一声
-      if (desire.exitKind === 'build_skill' && admin && out.reply) {
-        await sendPrivate(bot, admin, out.reply)
+      if (latest.exitKind === 'build_skill' && admin && out.reply) {
+        try {
+          await sendPrivate(bot, admin, out.reply)
+        } catch (sendErr) {
+          reportError(bot, 'desire_notify', sendErr)
+        }
       }
-      soul.store.logTrace({ traceId, event: 'desire_pursued_done', level: 'info', data: { desireId: desire.id, exitKind: desire.exitKind, steps: out.steps } })
+      soul.store.logTrace({ traceId, event: 'desire_pursued_done', level: 'info', data: { desireId: latest.id, exitKind: latest.exitKind, steps: out.steps } })
     } catch (e) {
-      // 真实受挫：不静默消失，记进展并轻微回流情绪
-      desire.stage = 'active'
-      desire.progressNote = `刚才试了一下没顺：${(e as Error).message.slice(0, 120)}`
-      desire.updatedAt = nowLocal(now)
-      soul.store.upsertDesire(desire)
+      // 真实受挫：同样检查期间是否已被管理员放弃
+      const latest = soul.store.getDesire(desire.id)
+      if (latest && latest.stage !== 'abandoned' && latest.stage !== 'faded') {
+        latest.stage = 'active'
+        latest.progressNote = `刚才试了一下没顺：${(e as Error).message.slice(0, 120)}`
+        latest.lastProgressAt = nowLocal(now)
+        latest.updatedAt = nowLocal(now)
+        soul.store.upsertDesire(latest)
+      }
       soul.body.appraise({
         source: 'desire',
         affectKind: 'sadness',
@@ -209,6 +304,8 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         now,
       })
       soul.store.logTrace({ traceId, event: 'desire_pursue_error', level: 'warn', data: { desireId: desire.id, error: (e as Error).message.slice(0, 180) } })
+    } finally {
+      inFlightDesires.delete(desire.id)
     }
   }
 
@@ -221,7 +318,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
     // 1) 身心墙钟演化（0 token）
     soul.body.tick(now)
 
-    // 2) 活动到点收尾：真实应用精力/PAD/驱力反馈 + 记见闻 + 回过神处理 pending_replies
+    // 2) 活动到点收尾：真实应用精力/PAD/驱力反馈 + 记见闻
     const finished = soul.body.completeActivityIfDue(now)
     if (finished) {
       if (finished.yields === 'sight' && finished.thinking) {
@@ -240,29 +337,44 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         })
       }
       soul.store.logTrace({ traceId, event: 'activity_finished', level: 'info', data: { id: finished.id, label: finished.label } })
+    }
 
-      // 回过神：依次回复忙的时候攒下的消息
-      for (const p of soul.store.takePendingReplies()) {
+    // 2.5) P1-STATE-02：只要当前空闲（包括刚忙完或进程重启后无活动），逐条消费 pending_replies，仅在投递成功后 ACK 删除
+    if (!soul.body.state(now).activity) {
+      const pendingList = soul.store.listPendingReplies()
+      for (const p of pendingList) {
         try {
           const target = targetOf(p.threadKey, p.userId)
-          await soul.handleTurn({
+          const notice = finished
+            ? `你刚才忙完「${finished.label}」，回过神看到了他之前发来的话。`
+            : '你现在空下来了，回过神看到了他之前发来的话。'
+          const out = await soul.handleTurn({
             mode: 'chat',
             threadKey: p.threadKey,
             userId: p.userId,
             userName: p.userName,
             text: p.text,
             isGroup: p.threadKey.startsWith('qq:group:'),
-            notice: `你刚才忙完「${finished.label}」，回过神看到了他之前发来的话。`,
+            notice,
             onReply: async (reply) => { await bot.transport?.send(target, { type: 'text', text: reply }) },
           })
-          soul.store.logTrace({ traceId, event: 'pending_reply_answered', level: 'info', data: { userId: p.userId } })
+          if (out.delivered && out.reply) {
+            soul.store.removePendingReply(p.id)
+            soul.store.logTrace({ traceId, event: 'pending_reply_answered', level: 'info', data: { userId: p.userId, pendingId: p.id } })
+          } else {
+            soul.store.logTrace({ traceId, event: 'pending_reply_deferred', level: 'warn', data: { userId: p.userId, pendingId: p.id, delivered: out.delivered } })
+          }
         } catch (e) {
-          soul.store.logTrace({ traceId, event: 'pending_reply_error', level: 'warn', data: { userId: p.userId, error: (e as Error).message.slice(0, 140) } })
+          soul.store.logTrace({ traceId, event: 'pending_reply_error', level: 'warn', data: { userId: p.userId, pendingId: p.id, error: (e as Error).message.slice(0, 140) } })
         }
       }
     }
 
-    // 3) 凭证填好自动唤醒 waiting_credential 的欲望（0 token）
+    // 3) P1-STATE-01：恢复上次崩溃遗留的 in_progress 任务 + 凭证填好自动唤醒 waiting_credential（0 token）
+    const recovered = soul.desires.recoverInterrupted(now, inFlightDesires)
+    if (recovered.length > 0) {
+      soul.store.logTrace({ traceId, event: 'desires_recovered', level: 'info', data: { ids: recovered.map((d) => d.id) } })
+    }
     const resumed = soul.desires.resumeReadyCredentials((name) => credentials.isReady(name), now)
     if (resumed.length > 0) {
       soul.store.logTrace({ traceId, event: 'desires_resumed_by_credential', level: 'info', data: { ids: resumed.map((d) => d.id) } })
@@ -305,9 +417,15 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         },
       )
       if (text) {
-        credentials.markAsked(dueCred.name, now)
         const full = `${text}${credentialFooter(bot, dueCred.label)}`
-        await sendPrivate(bot, admin, full)
+        // P0-RUN-01：先发送成功再 markAsked，发送失败时记录日志并保留未询问状态以便下次重试
+        try {
+          await sendPrivate(bot, admin, full)
+        } catch (sendErr) {
+          reportError(bot, 'credential_ask_send', sendErr)
+          return
+        }
+        credentials.markAsked(dueCred.name, now)
         soul.store.appendMessage({
           threadKey: `qq:private:${admin}`,
           role: 'assistant',
@@ -338,6 +456,12 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           },
         )
         if (text) {
+          try {
+            await sendPrivate(bot, admin, text)
+          } catch (sendErr) {
+            reportError(bot, 'approval_ask_send', sendErr)
+            return
+          }
           soul.approvals.open({
             kind: blocked.blocker.kind,
             targetId: blocked.id,
@@ -345,7 +469,6 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
             payload: blocked.blocker.payload ?? null,
             now,
           })
-          await sendPrivate(bot, admin, text)
           soul.store.appendMessage({
             threadKey: `qq:private:${admin}`,
             role: 'assistant',
@@ -362,7 +485,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
       }
     }
 
-    // 9) 概率日记（她的自主行为，走 solo 回合调 write_diary 工具）& 每日晚间反思
+    // 9) 概率日记（P1-CACHE-01：发送冻结的完整 toolLayers 保前缀缓存，用 allowedLayers 在执行期屏蔽 express）& 每日晚间反思
     const today = todayLocal(now)
     if (!diary.has(today) && shouldConsiderDiary(now, random)) {
       const todaysMemories = soul.store.recentMemories(30).filter((m) => m.createdAt.startsWith(today))
@@ -375,7 +498,8 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         userId: config.id,
         userName: soul.persona.name,
         text: `（今天快过去了。下面是今天记下的一些事：\n${material}\n\n你手边有 write_diary 工具，想写就用自己的口吻写几句今天；今天不想写也没关系。）`,
-        toolLayers: ['explore', 'create'],
+        toolLayers: ['explore', 'express', 'create'],
+        allowedLayers: ['explore', 'create'],
         reasoningEffort: 'low',
         maxSteps: 3,
       })
@@ -542,12 +666,24 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
 
   const tickOnce = async (): Promise<void> => {
     const now = clock.now()
-    await Promise.all(opts.bots.map((bot) => opts.queue.enqueue(bot.config.id, () => runBotMaintenance(bot, now))))
+    // P0-RUN-01：每个 Bot 独立收口异常，单 Bot 临时网络故障绝不拖垮整个进程或其它 Bot
+    await Promise.all(opts.bots.map((bot) =>
+      opts.queue.enqueue(bot.config.id, async () => {
+        try {
+          await runBotMaintenance(bot, now)
+        } catch (err) {
+          reportError(bot, 'maintenance_tick', err)
+        }
+      }),
+    ))
   }
 
   const pollBotSongs = async (bot: RhythmBot, now: Date): Promise<void> => {
     if (!bot.singing) return
-    const pending = bot.soul.store.listWorks('song', 10).filter((w) => w.status === 'generating' && w.externalTaskId)
+    // P1-STATE-03：SQL 层先按状态筛选再 LIMIT，绝不被新生成的 ready 作品挤掉旧的 generating / ready_undelivered 任务
+    const pending = bot.soul.store
+      .listWorksByStatus(['generating', 'ready_undelivered'], 20)
+      .filter((w) => w.kind === 'song')
     if (pending.length === 0) return
     const fetchImpl = bot.fetchImpl ?? globalThis.fetch
     const traceId = `song_${randomUUID().slice(0, 8)}`
@@ -555,71 +691,81 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
 
     for (const work of pending) {
       try {
-        const res = await bot.singing.pollSong(work.externalTaskId!)
-        if (res.status === 'pending' || res.status === 'processing') continue
+        let filePath = work.mediaPath
+        let bytes: Uint8Array | null = null
 
-        if (res.status === 'failed' || !res.audioUrl) {
+        if (work.status === 'generating') {
+          if (!work.externalTaskId) continue
+          const res = await bot.singing.pollSong(work.externalTaskId)
+          if (res.status === 'pending' || res.status === 'processing') continue
+
+          if (res.status === 'failed' || !res.audioUrl) {
+            bot.soul.store.upsertWork({
+              ...work,
+              status: 'failed',
+              moodNote: [work.moodNote, `失败：${res.error ?? '未返回音频'}`].filter(Boolean).join(' | ').slice(0, 180),
+            })
+            bot.soul.body.appraise({
+              source: 'life',
+              affectKind: work.forUser ? 'guilty' : 'sadness',
+              intensity: 0.35,
+              confidence: 0.75,
+              text: `答应的歌《${work.title}》没录成功`,
+              now,
+            })
+            if (work.forUser) {
+              bot.soul.relations.addSelfTension(work.forUser, `答应唱的《${work.title}》录制失败没交上`, 0.45, now)
+            }
+            bot.soul.store.logTrace({ traceId, event: 'song_failed', level: 'warn', data: { workId: work.id, error: res.error } })
+            continue
+          }
+
+          const audioRes = await fetchImpl(res.audioUrl, { signal: AbortSignal.timeout(60_000) })
+          if (!audioRes.ok) throw new Error(`download HTTP ${audioRes.status}`)
+          bytes = await downloadBytesBounded(audioRes, MAX_SONG_BYTES)
+
+          const songsDir = bot.songsDir ?? join(bot.config.dataDir, 'media', 'songs')
+          mkdirSync(songsDir, { recursive: true })
+          filePath = join(songsDir, `${work.id}.mp3`)
+          writeFileSync(filePath, bytes)
+
+          // 生成与投递分离：有接收对象时先落盘为 ready_undelivered，投递成功后才转为 ready
           bot.soul.store.upsertWork({
             ...work,
-            status: 'failed',
-            moodNote: [work.moodNote, `失败：${res.error ?? '未返回音频'}`].filter(Boolean).join(' | ').slice(0, 180),
+            status: work.forUser && bot.transport ? 'ready_undelivered' : 'ready',
+            mediaPath: filePath,
           })
           bot.soul.body.appraise({
             source: 'life',
-            affectKind: work.forUser ? 'guilty' : 'sadness',
-            intensity: 0.35,
-            confidence: 0.75,
-            text: `答应的歌《${work.title}》没录成功`,
+            affectKind: 'praised',
+            intensity: 0.45,
+            confidence: 0.85,
+            text: `唱完了《${work.title}》`,
             now,
           })
-          if (work.forUser) {
-            bot.soul.relations.addSelfTension(work.forUser, `答应唱的《${work.title}》录制失败没交上`, 0.45, now)
+          bot.soul.memory.remember({
+            kind: 'experience',
+            text: `我自己填词唱了一首歌《${work.title}》${work.forUser ? `送给${bot.soul.relations.nameOf(work.forUser)}` : ''}`,
+            about: work.forUser ? [work.forUser] : [],
+            sensitivity: 'open',
+            tier: 'lasting',
+            disclosable: 'volunteer',
+            consented: false,
+            source: 'life',
+            provenance: 'L0_external',
+            threadKey: 'life',
+            affect: 'praised',
+            createdAt: nowLocal(now),
+          })
+        }
+
+        if (work.forUser && bot.transport && filePath) {
+          if (!bytes) {
+            if (!existsSync(filePath)) throw new Error('saved song file missing for retry')
+            const st = statSync(filePath)
+            if (st.size === 0 || st.size > MAX_SONG_BYTES) throw new Error(`invalid saved song size ${st.size}`)
+            bytes = new Uint8Array(readFileSync(filePath))
           }
-          bot.soul.store.logTrace({ traceId, event: 'song_failed', level: 'warn', data: { workId: work.id, error: res.error } })
-          continue
-        }
-
-        const audioRes = await fetchImpl(res.audioUrl, { signal: AbortSignal.timeout(60_000) })
-        if (!audioRes.ok) throw new Error(`download HTTP ${audioRes.status}`)
-        const bytes = new Uint8Array(await audioRes.arrayBuffer())
-        if (bytes.byteLength === 0 || bytes.byteLength > 25 * 1024 * 1024) {
-          throw new Error(`invalid song size ${bytes.byteLength}`)
-        }
-
-        const songsDir = bot.songsDir ?? join(bot.config.dataDir, 'media', 'songs')
-        mkdirSync(songsDir, { recursive: true })
-        const filePath = join(songsDir, `${work.id}.mp3`)
-        writeFileSync(filePath, bytes)
-
-        bot.soul.store.upsertWork({
-          ...work,
-          status: 'ready',
-          mediaPath: filePath,
-        })
-        bot.soul.body.appraise({
-          source: 'life',
-          affectKind: 'praised',
-          intensity: 0.45,
-          confidence: 0.85,
-          text: `唱完了《${work.title}》`,
-          now,
-        })
-        bot.soul.memory.remember({
-          kind: 'experience',
-          text: `我自己填词唱了一首歌《${work.title}》${work.forUser ? `送给${bot.soul.relations.nameOf(work.forUser)}` : ''}`,
-          about: work.forUser ? [work.forUser] : [],
-          sensitivity: 'open',
-          tier: 'lasting',
-          disclosable: 'volunteer',
-          consented: false,
-          source: 'life',
-          provenance: 'L0_external',
-          threadKey: 'life',
-          affect: 'praised',
-          createdAt: nowLocal(now),
-        })
-
-        if (work.forUser && bot.transport) {
           const isGroupNote = work.moodNote?.startsWith('qq:group:')
           const target: SendTarget = isGroupNote
             ? { messageType: 'group', groupId: work.moodNote!.slice('qq:group:'.length) }
@@ -654,8 +800,13 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
             mediaJson: JSON.stringify({ workId: work.id, mediaPath: filePath }),
             createdAt: nowLocal(now),
           })
+          bot.soul.store.upsertWork({
+            ...work,
+            status: 'ready',
+            mediaPath: filePath,
+          })
         }
-        bot.soul.store.logTrace({ traceId, event: 'song_ready', level: 'info', data: { workId: work.id, title: work.title, bytes: bytes.byteLength } })
+        bot.soul.store.logTrace({ traceId, event: 'song_ready', level: 'info', data: { workId: work.id, title: work.title, bytes: bytes?.byteLength ?? 0 } })
       } catch (e) {
         bot.soul.store.logTrace({ traceId, event: 'song_poll_error', level: 'warn', data: { workId: work.id, error: (e as Error).message.slice(0, 160) } })
       }
@@ -664,51 +815,63 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
 
   const songTick = async (): Promise<void> => {
     const now = clock.now()
-    await Promise.all(opts.bots.map((bot) => opts.queue.enqueue(bot.config.id, () => pollBotSongs(bot, now))))
+    await Promise.all(opts.bots.map((bot) =>
+      opts.queue.enqueue(bot.config.id, async () => {
+        try {
+          await pollBotSongs(bot, now)
+        } catch (err) {
+          reportError(bot, 'song_tick', err)
+        }
+      }),
+    ))
   }
 
   const reminderTick = async (): Promise<void> => {
     const now = clock.now()
     await Promise.all(opts.bots.map((bot) => opts.queue.enqueue(bot.config.id, async () => {
-      await pollBotSongs(bot, now)
-      const due = bot.soul.store.dueSchedules(now.toISOString(), 'reminder')
-      if (due.length === 0) return
-      const model = bot.soul.auxModel ?? bot.soul.chatModel
-      const traceId = `rem_${randomUUID().slice(0, 8)}`
-      for (const item of due) {
-        try {
-          const text = await composeOutreach(
-            { model, store: bot.soul.store, persona: bot.soul.persona, priceTable: opts.priceTable },
-            {
-              traceId,
-              purpose: `他之前托你到点喊他：「${item.text}」。现在时间到了，用你自己的方式自然喊他一声。`,
-              relationFacts: bot.soul.relations.renderRelationFacts({
-                userId: item.userId,
-                now,
-                sharedStories: bot.soul.memory.sharedStories(item.userId, 2),
-              }),
-              memoryFacts: '',
-              bodyFacts: bot.soul.body.renderBodyFacts(now),
-            },
-          )
-          if (text) {
-            await bot.transport?.send(targetOf(item.threadKey, item.userId), { type: 'text', text })
-            bot.soul.store.appendMessage({
-              threadKey: item.threadKey,
-              role: 'assistant',
-              userId: bot.config.id,
-              userName: bot.soul.persona.name,
-              content: text,
-              toolSummary: null,
-              mediaJson: null,
-              createdAt: nowLocal(now),
-            })
-            bot.soul.store.updateScheduleStatus(item.id, 'done')
-            bot.soul.store.logTrace({ traceId, event: 'reminder_sent', level: 'info', data: { id: item.id, userId: item.userId } })
+      try {
+        await pollBotSongs(bot, now)
+        const due = bot.soul.store.dueSchedules(now.toISOString(), 'reminder')
+        if (due.length === 0) return
+        const model = bot.soul.auxModel ?? bot.soul.chatModel
+        const traceId = `rem_${randomUUID().slice(0, 8)}`
+        for (const item of due) {
+          try {
+            const text = await composeOutreach(
+              { model, store: bot.soul.store, persona: bot.soul.persona, priceTable: opts.priceTable },
+              {
+                traceId,
+                purpose: `他之前托你到点喊他：「${item.text}」。现在时间到了，用你自己的方式自然喊他一声。`,
+                relationFacts: bot.soul.relations.renderRelationFacts({
+                  userId: item.userId,
+                  now,
+                  sharedStories: bot.soul.memory.sharedStories(item.userId, 2),
+                }),
+                memoryFacts: '',
+                bodyFacts: bot.soul.body.renderBodyFacts(now),
+              },
+            )
+            if (text) {
+              await bot.transport?.send(targetOf(item.threadKey, item.userId), { type: 'text', text })
+              bot.soul.store.appendMessage({
+                threadKey: item.threadKey,
+                role: 'assistant',
+                userId: bot.config.id,
+                userName: bot.soul.persona.name,
+                content: text,
+                toolSummary: null,
+                mediaJson: null,
+                createdAt: nowLocal(now),
+              })
+              bot.soul.store.updateScheduleStatus(item.id, 'done')
+              bot.soul.store.logTrace({ traceId, event: 'reminder_sent', level: 'info', data: { id: item.id, userId: item.userId } })
+            }
+          } catch (e) {
+            bot.soul.store.logTrace({ traceId, event: 'reminder_error', level: 'warn', data: { id: item.id, error: (e as Error).message.slice(0, 140) } })
           }
-        } catch (e) {
-          bot.soul.store.logTrace({ traceId, event: 'reminder_error', level: 'warn', data: { id: item.id, error: (e as Error).message.slice(0, 140) } })
         }
+      } catch (err) {
+        reportError(bot, 'reminder_tick', err)
       }
     })))
   }
@@ -716,9 +879,13 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
   return {
     start() {
       startedAt = clock.now().getTime()
-      timer = setInterval(() => { void tickOnce() }, tickMs)
+      timer = setInterval(() => {
+        void tickOnce().catch((err) => reportError(null, 'timer_tick', err))
+      }, tickMs)
       timer.unref?.()
-      reminderTimer = setInterval(() => { void reminderTick() }, reminderTickMs)
+      reminderTimer = setInterval(() => {
+        void reminderTick().catch((err) => reportError(null, 'timer_reminder', err))
+      }, reminderTickMs)
       reminderTimer.unref?.()
     },
     stop() {

@@ -34,8 +34,16 @@ export const BotConfigSchema = z.object({
     quietHours: z.tuple([z.string(), z.string()]).optional(),
     exitPhrases: z.array(z.string()).default(['别发了', '我想安静会', '别吵', '闭嘴']),
     autonomyBuildEnabled: z.boolean().default(true),
+    /** P0-SEC-01：默认关闭未沙箱化的本机命令执行，需显式开启 */
+    allowUnsafeLocalExec: z.boolean().default(false),
     credentialsPath: z.string().optional(),
-  }).default({ enabled: false, allowlist: [], exitPhrases: ['别发了', '我想安静会', '别吵', '闭嘴'], autonomyBuildEnabled: true }),
+  }).default({
+    enabled: false,
+    allowlist: [],
+    exitPhrases: ['别发了', '我想安静会', '别吵', '闭嘴'],
+    autonomyBuildEnabled: true,
+    allowUnsafeLocalExec: false,
+  }),
   budget: z.object({
     // 自主行为（生活/联想/造能力）每日输入+输出 token 软上限，超限自动休眠，不影响陪聊
     dailyAutonomousTokens: z.number().int().positive().default(120_000),
@@ -147,6 +155,8 @@ export const ZysoulConfigSchema = z.object({
     host: z.string().default('127.0.0.1'),
     port: z.number().int().positive().default(8788),
     publicUrl: z.string().optional(),
+    /** 仅当部署在可信反向代理（如 Nginx 覆写 XFF）后时启用 */
+    trustProxy: z.boolean().default(false),
   }).optional(),
   bots: z.array(BotConfigSchema).default([]),
 })

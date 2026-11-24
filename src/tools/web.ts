@@ -1,8 +1,16 @@
 // 探索类联网工具：web_search（支持 Responses API 内置搜索或 Streamable-HTTP MCP）与 SSRF 防护 web_fetch。
 // 工具结果严格截断并附带 1 行 foldSummary，避免大段网页正文污染后续轮次 Token。
+import { lookup as dnsLookup } from 'node:dns/promises'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import { isIP } from 'node:net'
 import { z } from 'zod'
 import { resolveEnvValue } from '../shared/time.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
+
+const MAX_WEB_FETCH_BYTES = 512 * 1024
+
+export type DnsLookupFn = (hostname: string) => Promise<Array<{ address: string; family: number }>>
 
 export interface WebSearchConfig {
   /** 优先使用 Streamable-HTTP MCP（如百炼 WebSearch / EnhancedSearch） */
@@ -18,6 +26,8 @@ export interface WebSearchConfig {
     model: string
   }
   fetchImpl?: typeof fetch
+  lookupImpl?: DnsLookupFn
+  maxFetchBytes?: number
   timeoutMs?: number
 }
 
@@ -29,7 +39,90 @@ const FetchArgsSchema = z.object({
   url: z.string().url().max(600),
 })
 
-// SSRF 防护：拦截内网地址、回环地址与云元数据地址
+function isPublicIpv4Parts(a: number, b: number, c: number, d: number): boolean {
+  if ([a, b, c, d].some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false
+  if (a === 0 || a === 10 || a === 127) return false
+  if (a === 100 && b >= 64 && b <= 127) return false // CGNAT
+  if (a === 169 && b === 254) return false // link-local / cloud metadata
+  if (a === 172 && b >= 16 && b <= 31) return false
+  if (a === 192 && b === 0 && (c === 0 || c === 2)) return false
+  if (a === 192 && b === 168) return false
+  if (a === 198 && (b === 18 || b === 19)) return false
+  if (a === 198 && b === 51 && c === 100) return false
+  if (a === 203 && b === 0 && c === 113) return false
+  if (a >= 224) return false // multicast & reserved
+  return true
+}
+
+function expandIpv6(raw: string): number[] | null {
+  const ip = raw.toLowerCase().split('%')[0] ?? ''
+  if (!ip) return null
+  // 处理末尾内嵌 IPv4 形式，如 ::ffff:127.0.0.1
+  let normalized = ip
+  const lastColon = ip.lastIndexOf(':')
+  if (lastColon >= 0 && ip.slice(lastColon + 1).includes('.')) {
+    const v4 = ip.slice(lastColon + 1).split('.').map(Number)
+    if (v4.length !== 4 || v4.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null
+    const hi = ((v4[0]! << 8) | v4[1]!).toString(16)
+    const lo = ((v4[2]! << 8) | v4[3]!).toString(16)
+    normalized = `${ip.slice(0, lastColon)}:${hi}:${lo}`
+  }
+
+  const halves = normalized.split('::')
+  if (halves.length > 2) return null
+  const left = halves[0] ? halves[0].split(':').filter(Boolean) : []
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':').filter(Boolean) : []
+  if (halves.length === 1 && left.length !== 8) return null
+  const missing = 8 - (left.length + right.length)
+  if (missing < 0) return null
+  const parts = halves.length === 2
+    ? [...left, ...Array.from({ length: missing }, () => '0'), ...right]
+    : left
+  if (parts.length !== 8) return null
+  const groups: number[] = []
+  for (const p of parts) {
+    if (!/^[0-9a-f]{1,4}$/.test(p)) return null
+    groups.push(Number.parseInt(p, 16))
+  }
+  return groups
+}
+
+export function isPublicIpAddress(rawIp: string): boolean {
+  const clean = rawIp.trim().toLowerCase().replace(/^\[|\]$/g, '').split('%')[0] ?? ''
+  const kind = isIP(clean)
+  if (kind === 4) {
+    const parts = clean.split('.').map(Number)
+    return isPublicIpv4Parts(parts[0]!, parts[1]!, parts[2]!, parts[3]!)
+  }
+  if (kind === 6) {
+    const g = expandIpv6(clean)
+    if (!g) return false
+    const allZero = g.every((x) => x === 0)
+    if (allZero) return false // ::
+    if (g.slice(0, 7).every((x) => x === 0) && g[7] === 1) return false // ::1
+    // IPv4-mapped (::ffff:0:0/96) 与 IPv4-compatible (::/96)
+    if (g.slice(0, 5).every((x) => x === 0) && (g[5] === 0xffff || g[5] === 0)) {
+      const a = (g[6]! >> 8) & 0xff
+      const b = g[6]! & 0xff
+      const c = (g[7]! >> 8) & 0xff
+      const d = g[7]! & 0xff
+      return isPublicIpv4Parts(a, b, c, d)
+    }
+    // NAT64 well-known prefix 64:ff9b::/96
+    if (g[0] === 0x0064 && g[1] === 0xff9b && g[2] === 0 && g[3] === 0 && g[4] === 0 && g[5] === 0) {
+      return isPublicIpv4Parts((g[6]! >> 8) & 0xff, g[6]! & 0xff, (g[7]! >> 8) & 0xff, g[7]! & 0xff)
+    }
+    if ((g[0]! & 0xfe00) === 0xfc00) return false // fc00::/7 ULA
+    if ((g[0]! & 0xffc0) === 0xfe80) return false // fe80::/10 link-local
+    if ((g[0]! & 0xff00) === 0xff00) return false // ff00::/8 multicast
+    if (g[0] === 0x0100 && g[1] === 0 && g[2] === 0 && g[3] === 0) return false // 100::/64 discard
+    if (g[0] === 0x2001 && g[1] === 0x0db8) return false // documentation
+    return true
+  }
+  return false
+}
+
+// SSRF 防护（P0-SEC-02）：规范化末尾点，拦截本机/内网域名、IPv4、IPv6 及 IPv4-mapped IPv6
 export function isSafePublicUrl(rawUrl: string): boolean {
   let u: URL
   try {
@@ -38,19 +131,166 @@ export function isSafePublicUrl(rawUrl: string): boolean {
     return false
   }
   if (u.protocol !== 'http:' && u.protocol !== 'https:') return false
-  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '')
-  if (!host || host === 'localhost' || host.endsWith('.local') || host.endsWith('.internal')) return false
-  if (host === '::1' || host.startsWith('fe80:') || host.startsWith('fc') || host.startsWith('fd')) return false
-  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host)
-  if (m) {
-    const [a, b] = [Number(m[1]), Number(m[2])]
-    if (a === 127 || a === 10 || a === 0) return false
-    if (a === 169 && b === 254) return false
-    if (a === 192 && b === 168) return false
-    if (a === 172 && b >= 16 && b <= 31) return false
-    if (a === 100 && b >= 64 && b <= 127) return false
+  const host = u.hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '')
+  if (!host) return false
+  if (
+    host === 'localhost'
+    || host.endsWith('.localhost')
+    || host.endsWith('.local')
+    || host.endsWith('.internal')
+  ) {
+    return false
   }
+  if (isIP(host)) return isPublicIpAddress(host)
   return true
+}
+
+async function readStreamBounded(
+  res: Response,
+  maxBytes: number,
+): Promise<{ text: string; overflowed: boolean }> {
+  if (!res.body) {
+    const txt = await res.text()
+    const bytes = Buffer.byteLength(txt, 'utf8')
+    if (bytes > maxBytes) {
+      return { text: Buffer.from(txt, 'utf8').subarray(0, maxBytes).toString('utf8'), overflowed: true }
+    }
+    return { text: txt, overflowed: false }
+  }
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  let overflowed = false
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      if (total + value.byteLength > maxBytes) {
+        const remain = Math.max(0, maxBytes - total)
+        if (remain > 0) chunks.push(value.subarray(0, remain))
+        overflowed = true
+        await reader.cancel().catch(() => {})
+        break
+      }
+      chunks.push(value)
+      total += value.byteLength
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return { text: Buffer.concat(chunks).toString('utf8'), overflowed }
+}
+
+async function resolveAndVerifyHost(
+  hostname: string,
+  lookupImpl: DnsLookupFn,
+): Promise<{ address: string; family: number } | null> {
+  const clean = hostname.toLowerCase().replace(/^\[|\]$/g, '').replace(/\.+$/, '')
+  const ipKind = isIP(clean)
+  if (ipKind) {
+    return isPublicIpAddress(clean) ? { address: clean, family: ipKind } : null
+  }
+  const records = await lookupImpl(clean)
+  if (!records.length) return null
+  for (const r of records) {
+    if (!isPublicIpAddress(r.address)) return null
+  }
+  return records[0]!
+}
+
+// 绑定已验证 IP 发起 HTTP/HTTPS 请求：阻断 DNS 重绑定、拒绝自动 3xx 重定向、强制流式字节预算
+async function pinnedPublicHttpGet(
+  rawUrl: string,
+  pinned: { address: string; family: number },
+  maxBytes: number,
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<{ status: number; contentType: string; text: string; overflowed: boolean }> {
+  const u = new URL(rawUrl)
+  const isHttps = u.protocol === 'https:'
+  const reqFn = isHttps ? httpsRequest : httpRequest
+  const port = u.port ? Number(u.port) : (isHttps ? 443 : 80)
+
+  return new Promise((resolveReq, rejectReq) => {
+    const req = reqFn(
+      {
+        protocol: u.protocol,
+        hostname: u.hostname,
+        port,
+        path: `${u.pathname}${u.search}`,
+        method: 'GET',
+        headers: {
+          Host: u.host,
+          'User-Agent': 'ZySoulBot/0.1 (companion reader)',
+        },
+        // 将实际 TCP 连接绑定到已校验通过的公网 IP，防止 TOCTOU DNS 重绑定
+        lookup: (_host, _opts, cb) => {
+          cb(null, pinned.address, pinned.family)
+        },
+        ...(isHttps ? { servername: u.hostname.replace(/^\[|\]$/g, '') } : {}),
+      },
+      (res) => {
+        const status = res.statusCode ?? 0
+        const contentType = String(res.headers['content-type'] ?? '')
+        if (status >= 300 && status < 400) {
+          res.resume()
+          resolveReq({ status, contentType, text: '', overflowed: false })
+          return
+        }
+        const chunks: Buffer[] = []
+        let total = 0
+        let overflowed = false
+        res.on('data', (chunk: Buffer) => {
+          if (overflowed) return
+          if (total + chunk.length > maxBytes) {
+            const remain = Math.max(0, maxBytes - total)
+            if (remain > 0) chunks.push(chunk.subarray(0, remain))
+            overflowed = true
+            res.destroy()
+            resolveReq({
+              status,
+              contentType,
+              text: Buffer.concat(chunks).toString('utf8'),
+              overflowed: true,
+            })
+            return
+          }
+          chunks.push(chunk)
+          total += chunk.length
+        })
+        res.on('end', () => {
+          if (!overflowed) {
+            resolveReq({
+              status,
+              contentType,
+              text: Buffer.concat(chunks).toString('utf8'),
+              overflowed: false,
+            })
+          }
+        })
+        res.on('error', (err) => {
+          if (!overflowed) rejectReq(err)
+        })
+      },
+    )
+
+    const onAbort = (): void => {
+      req.destroy(new Error('Request aborted'))
+    }
+    if (signal) {
+      if (signal.aborted) {
+        onAbort()
+        return
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+    }
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error('Request timeout'))
+    })
+    req.on('error', (err) => rejectReq(err))
+    req.end()
+  })
 }
 
 export function stripHtmlToText(html: string): string {
@@ -152,6 +392,12 @@ async function callResponsesSearch(
 
 export function registerWebTools(registry: InMemoryToolRegistry, cfg: WebSearchConfig = {}): void {
   const fetchImpl = cfg.fetchImpl ?? globalThis.fetch
+  const lookupImpl: DnsLookupFn = cfg.lookupImpl
+    ?? (async (hostname: string) => {
+      const res = await dnsLookup(hostname, { all: true, verbatim: true })
+      return res.map((r) => ({ address: r.address, family: r.family }))
+    })
+  const maxFetchBytes = cfg.maxFetchBytes ?? MAX_WEB_FETCH_BYTES
   const timeoutMs = cfg.timeoutMs ?? 20_000
 
   if (cfg.mcp || cfg.responses) {
@@ -212,23 +458,65 @@ export function registerWebTools(registry: InMemoryToolRegistry, cfg: WebSearchC
       if (!isSafePublicUrl(url)) {
         return { output: '不能访问内网或非公开网址。', isError: true }
       }
-      const timeout = AbortSignal.timeout(timeoutMs)
-      const combined = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout
-      const res = await fetchImpl(url, {
-        headers: { 'User-Agent': 'zySoulbot/0.1 (companion reader)' },
-        redirect: 'follow',
-        signal: combined,
-      })
-      if (!res.ok) {
-        return { output: `网页打开失败（HTTP ${res.status}）。`, isError: true }
+      const parsedUrl = new URL(url)
+      let ctype = ''
+      let raw = ''
+
+      if (cfg.fetchImpl) {
+        // 即使使用注入 fetch（单测或自定义适配器），依然校验 DNS（若提供 lookupImpl）、禁止自动跳转并执行流式字节预算
+        if (cfg.lookupImpl) {
+          const pinned = await resolveAndVerifyHost(parsedUrl.hostname, cfg.lookupImpl)
+          if (!pinned) return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
+        }
+        const timeout = AbortSignal.timeout(timeoutMs)
+        const combined = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout
+        let res: Response
+        try {
+          res = await cfg.fetchImpl(url, {
+            headers: { 'User-Agent': 'ZySoulBot/0.1 (companion reader)' },
+            redirect: 'error',
+            signal: combined,
+          })
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return { output: `网页请求被拒绝或失败：${msg.slice(0, 120)}`, isError: true }
+        }
+        if (res.status >= 300 && res.status < 400) {
+          return { output: '网页重定向被安全策略拦截。', isError: true }
+        }
+        if (!res.ok) {
+          return { output: `网页打开失败（HTTP ${res.status}）。`, isError: true }
+        }
+        ctype = res.headers.get('content-type') ?? ''
+        const bounded = await readStreamBounded(res, maxFetchBytes)
+        raw = bounded.text
+      } else {
+        const pinned = await resolveAndVerifyHost(parsedUrl.hostname, lookupImpl)
+        if (!pinned) {
+          return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
+        }
+        let fetched: { status: number; contentType: string; text: string; overflowed: boolean }
+        try {
+          fetched = await pinnedPublicHttpGet(url, pinned, maxFetchBytes, timeoutMs, ctx.signal)
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return { output: `网页打开失败：${msg.slice(0, 120)}`, isError: true }
+        }
+        if (fetched.status >= 300 && fetched.status < 400) {
+          return { output: '网页重定向被安全策略拦截。', isError: true }
+        }
+        if (fetched.status < 200 || fetched.status >= 300) {
+          return { output: `网页打开失败（HTTP ${fetched.status}）。`, isError: true }
+        }
+        ctype = fetched.contentType
+        raw = fetched.text
       }
-      const ctype = res.headers.get('content-type') ?? ''
-      const raw = await res.text()
+
       const readable = ctype.includes('html') ? stripHtmlToText(raw) : raw.trim()
       const clipped = readable.slice(0, 2200)
       return {
         output: clipped || '页面没有可读正文。',
-        foldSummary: `读了网页 ${new URL(url).hostname}：${clipped.slice(0, 50)}`,
+        foldSummary: `读了网页 ${parsedUrl.hostname}：${clipped.slice(0, 50)}`,
       }
     },
   })

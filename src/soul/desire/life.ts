@@ -11,6 +11,7 @@ import type {
 } from '../../shared/ports.ts'
 import { nowLocal, timeHHMM, todayLocal } from '../../shared/time.ts'
 import { timeSlotOf } from '../body/engine.ts'
+import { MemoryEngine } from '../memory/engine.ts'
 import type { PersonaPack } from '../persona/pack.ts'
 import { estimateCostCny } from '../agent/loop.ts'
 import type { PriceTable } from '../agent/loop.ts'
@@ -484,22 +485,25 @@ export async function reflectOnToday(
     const parsed = ReflectSchema.safeParse(JSON.parse(m[0]))
     if (!parsed.success) return 0
 
+    // P1-MEM-01：睡前反思统一走 MemoryEngine.remember，受 L2_internal tier 封顶（season）与 3-gram 去重保护
+    const memory = new MemoryEngine(deps.store)
     let added = 0
     for (const text of parsed.data.insights) {
-      deps.store.addMemory({
+      const saved = memory.remember({
         kind: 'insight',
         text,
         about: [],
         sensitivity: 'open',
-        tier: 'lasting',
+        tier: 'season',
         disclosable: 'when-asked',
         consented: false,
         source: 'life',
+        provenance: 'L2_internal',
         threadKey: 'life',
         affect: null,
         createdAt: nowLocal(now),
       })
-      added += 1
+      if (saved) added += 1
     }
     if (added > 0) {
       deps.store.logTrace({ traceId: opts.traceId, event: 'reflect_done', level: 'info', data: { count: added, day } })

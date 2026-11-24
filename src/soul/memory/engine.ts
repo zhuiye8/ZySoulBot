@@ -76,9 +76,19 @@ export function visibilityOf(
   item: MemoryItem,
   ctx: { listener: string; tier: IntimacyTier; isGroup: boolean },
 ): 'full' | 'vague' | 'no' {
+  // P0-PRIV-01：群聊隐私边界必须先于 aboutSelf 快捷分支！私聊里的未授权私密/绝密内容绝不带进群聊
+  if (
+    ctx.isGroup
+    && item.source === 'private'
+    && !item.consented
+    && (item.sensitivity === 'private' || item.sensitivity === 'critical' || item.disclosable === 'secretive')
+  ) {
+    return 'no'
+  }
   const aboutSelf = item.about.length === 0 || item.about.includes(ctx.listener)
   if (aboutSelf) return 'full'
   if (item.consented) return 'full'
+  if (item.disclosable === 'secretive') return 'no'
   if (item.sensitivity === 'open') return 'full'
   if (ctx.isGroup) {
     if (item.sensitivity === 'personal') return item.source === 'group' ? 'full' : 'vague'
@@ -231,11 +241,54 @@ export class MemoryEngine {
     return { text: lines.join('\n'), touchedIds }
   }
 
-  // 捞取与某人的共同故事（关系紧绷期暂时压低温情共同故事数量，避免冲淡当下冲突现场）
-  sharedStories(userId: string, limit = 3, opts: { isStrained?: boolean } = {}): MemoryItem[] {
+  // P0-PRIV-01 统一披露检索入口（供 recall_memory 工具调用）：严格走与 recallForTurn 相同的 visibilityOf 边界
+  searchVisible(ctx: {
+    query: string
+    listener: string
+    tier: IntimacyTier
+    isGroup: boolean
+    solo?: boolean
+    limit?: number
+    nameOf?: (userId: string) => string
+  }): Array<{ item: MemoryItem; text: string; visibility: 'full' | 'vague' }> {
+    const limit = ctx.limit ?? 8
+    const rawHits = this.store.searchMemories(ctx.query, Math.max(limit * 3, 18))
+    const out: Array<{ item: MemoryItem; text: string; visibility: 'full' | 'vague' }> = []
+    let l2Count = 0
+    const nameOf = ctx.nameOf ?? ((u: string) => u)
+    for (const item of rawHits) {
+      if (item.provenance === 'L2_internal' && l2Count >= 1) continue
+      const vis = ctx.solo && !ctx.isGroup
+        ? 'full'
+        : visibilityOf(item, { listener: ctx.listener, tier: ctx.tier, isGroup: ctx.isGroup })
+      if (vis === 'no') continue
+      const text = vis === 'full'
+        ? item.text
+        : vagueOf(item.text, item.about.flatMap((u) => [u, nameOf(u)]))
+      if (!text) continue
+      if (item.provenance === 'L2_internal') l2Count++
+      out.push({ item, text, visibility: vis })
+      if (out.length >= limit) break
+    }
+    return out
+  }
+
+  // 捞取与某人的共同故事（关系紧绷期暂时压低温情共同故事数量，且经过统一隐私披露过滤）
+  sharedStories(
+    userId: string,
+    limit = 3,
+    opts: { isStrained?: boolean; isGroup?: boolean; listener?: string; tier?: IntimacyTier } = {},
+  ): MemoryItem[] {
     const cap = opts.isStrained ? Math.min(1, limit) : limit
+    const listener = opts.listener ?? userId
+    const isGroup = opts.isGroup ?? false
+    const tier = opts.tier ?? 'low'
     return this.store.memoriesAbout(userId, 24)
-      .filter((m) => m.provenance !== 'L2_internal' && (m.kind === 'experience' || m.tier === 'lasting' || m.tier === 'permanent'))
+      .filter((m) => {
+        if (m.provenance === 'L2_internal') return false
+        if (!(m.kind === 'experience' || m.tier === 'lasting' || m.tier === 'permanent')) return false
+        return visibilityOf(m, { listener, tier, isGroup }) === 'full'
+      })
       .slice(0, cap)
   }
 

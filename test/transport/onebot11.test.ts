@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { extractImages, extractRich, extractText, isAtMe, threadKeyOf } from '../../src/transport/onebot11/routing.ts'
 import { splitReply } from '../../src/transport/onebot11/deliver.ts'
@@ -123,7 +124,7 @@ describe('createApp full offline integration (OneBot11 -> Soul -> Tool -> Reply 
       bots: [{
         id: 'nahida',
         dataDir: tempDataDir,
-        personaDir: resolve('c:/Files/work/qq-bot/zySoulbot/personas/nahida'),
+        personaDir: fileURLToPath(new URL('../../personas/nahida', import.meta.url)),
         selfId: '3164305169',
         napcatWs: 'ws://127.0.0.1:3003',
         access: { users: ['1563359387'], groups: [], admins: ['1563359387'] },

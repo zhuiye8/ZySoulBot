@@ -8,6 +8,7 @@ import type {
   ToolSpec,
 } from '../shared/ports.ts'
 import type { PersonaPack } from '../soul/persona/pack.ts'
+import { intimacyTierOf, MemoryEngine } from '../soul/memory/engine.ts'
 
 function canonicalizeJson(val: unknown): unknown {
   if (Array.isArray(val)) return val.map(canonicalizeJson)
@@ -59,8 +60,10 @@ const WorldviewArgsSchema = z.object({
 
 export function registerSelfExplorationTools(
   registry: InMemoryToolRegistry,
-  deps: { store: SoulStore; persona: PersonaPack },
+  deps: { store: SoulStore; persona: PersonaPack; memory?: MemoryEngine },
 ): void {
+  const memory = deps.memory ?? new MemoryEngine(deps.store)
+
   registry.register({
     layer: 'explore',
     spec: {
@@ -74,13 +77,26 @@ export function registerSelfExplorationTools(
         required: ['query'],
       },
     },
-    async execute(args) {
+    async execute(args, ctx) {
       const { query } = RecallArgsSchema.parse(args)
-      const hits = deps.store.searchMemories(query, 8)
+      const rel = ctx.userId ? deps.store.getRelation(ctx.userId) : null
+      const tier = intimacyTierOf(rel?.stage ?? 'stranger')
+      const hits = memory.searchVisible({
+        query,
+        listener: ctx.userId,
+        tier,
+        isGroup: ctx.isGroup,
+        solo: ctx.solo,
+        limit: 8,
+        nameOf: (u) => deps.store.getRelation(u)?.callName ?? u,
+      })
       if (hits.length === 0) {
         return { output: `翻了翻记忆，没找到关于「${query}」的记录。`, foldSummary: `回忆「${query}」：未找到` }
       }
-      const lines = hits.map((m) => `- [${m.createdAt.slice(0, 10)}] (${m.kind}) ${m.text}`)
+      const lines = hits.map(({ item, text }) => {
+        const provTag = item.provenance === 'L2_internal' ? '[随想] ' : ''
+        return `- [${item.createdAt.slice(0, 10)}] (${item.kind}) ${provTag}${text}`
+      })
       return {
         output: lines.join('\n'),
         foldSummary: `回忆「${query}」：想起 ${hits.length} 条`,

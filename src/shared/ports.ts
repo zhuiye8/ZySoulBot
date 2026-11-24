@@ -42,6 +42,8 @@ export interface ChatMessage {
   toolCalls?: ToolCall[]
   toolCallId?: string
   name?: string
+  /** DeepSeek thinking+tools 等模式要求在后续工具回传中保留推理正文 */
+  reasoningContent?: string
 }
 
 export interface ToolSpec {
@@ -74,6 +76,7 @@ export interface ChatResponse {
   finishReason: FinishReason
   usage: TokenUsage
   model: string
+  reasoningContent?: string
 }
 
 export interface ChatModel {
@@ -247,6 +250,8 @@ export interface RelationTension {
   repaidRatio: number // 0..0.75
   repeatCount: number // 14 天内同类复发次数
   clearAirAsked?: boolean
+  /** 上次完成时间衰减的时间戳（保证同日重复调用严格幂等） */
+  lastDecayedAt?: string
   createdAt: string
 }
 
@@ -308,6 +313,9 @@ export interface BodyState {
   energy: number // 0..1，生理精力
   sleepDebt: number // 0..1，睡眠债（深夜未休累积）
   activity: ActiveActivity | null
+  /** 持久化 L2 内部每日心境波动限额（跨进程重启不重置） */
+  l2MoodDay?: string
+  l2MoodDelta?: number
   lastTickAt: string
   updatedAt: string
 }
@@ -348,6 +356,12 @@ export interface DesireRecord {
   progressNote: string | null
   aboutUser: string | null
   parentId: string | null
+  /** 最近一次真实推进时间戳（与 tick 时间分离，防止卡死任务被无限续期 TTL） */
+  lastProgressAt?: string
+  /** 人工一次性批准后记录的授权版本号，解锁当前任务不受全局 autonomyBuildEnabled 阻挡 */
+  approvedPlanVersion?: number
+  /** 审批拒绝后的冷静期截止时间 */
+  rejectedUntil?: string
   createdAt: string
   updatedAt: string
 }
@@ -399,7 +413,7 @@ export interface WorkRecord {
   title: string
   content: string
   mediaPath: string | null
-  status: 'draft' | 'generating' | 'ready' | 'failed'
+  status: 'draft' | 'generating' | 'ready_undelivered' | 'ready' | 'failed'
   externalTaskId: string | null
   forUser: string | null
   moodNote: string | null
@@ -481,6 +495,7 @@ export interface SoulStore {
   addPendingReply(item: Omit<PendingReply, 'id' | 'createdAt'> & { createdAt?: string }): void
   takePendingReplies(): PendingReply[]
   listPendingReplies(): PendingReply[]
+  removePendingReply(id: number): boolean
 
   // 能力与作品
   upsertCapability(cap: CapabilityRecord): void
@@ -488,6 +503,7 @@ export interface SoulStore {
   upsertWork(work: WorkRecord): void
   getWork(id: string): WorkRecord | null
   listWorks(kind?: WorkRecord['kind'], limit?: number): WorkRecord[]
+  listWorksByStatus(statuses: WorkRecord['status'][], limit?: number): WorkRecord[]
 
   // Token 账本与 Trace
   recordTokens(entry: TokenLedgerEntry): void

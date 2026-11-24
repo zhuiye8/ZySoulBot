@@ -92,7 +92,6 @@ export class BodyEngine {
   readonly traits: Required<Traits>
   readonly baseline: PAD
   private recentNeg: Array<{ kind: AffectKind; at: number }> = []
-  private dailyInternalMoodDelta = new Map<string, number>()
 
   constructor(store: SoulStore, traits?: Traits, baseline?: PAD) {
     this.store = store
@@ -104,6 +103,17 @@ export class BodyEngine {
       N: traits?.N ?? 0.25,
     }
     this.baseline = baseline ?? { p: 0.2, a: -0.08, d: 0.1 }
+  }
+
+  // P1-AFF-04：持久化单日 L2 内部心境改变量限额（±0.05/天），跨重启不重置，且覆盖内部活动完成与 life/desire 情绪评估
+  private applyPersistentL2MoodDelta(s: BodyState, requestedDeltaP: number, now: Date): number {
+    const dayKey = todayLocal(now)
+    const used = s.l2MoodDay === dayKey ? (s.l2MoodDelta ?? 0) : 0
+    const nextUsed = clamp(used + requestedDeltaP, -MAX_DAILY_INTERNAL_MOOD_DELTA, MAX_DAILY_INTERNAL_MOOD_DELTA)
+    const allowed = nextUsed - used
+    s.l2MoodDay = dayKey
+    s.l2MoodDelta = nextUsed
+    return allowed
   }
 
   state(now: Date = new Date()): BodyState {
@@ -198,17 +208,13 @@ export class BodyEngine {
     const applied: Partial<PAD> = {}
     const moodRatio = NEGATIVE_AFFECT_KINDS.has(kind) ? 0.45 : 0.35
     const isInternal = inp.source === 'life' || inp.source === 'desire'
-    const dayKey = todayLocal(now)
     for (const k of PAD_KEYS) {
       const before = s.pad[k]
       s.pad[k] = clamp(s.pad[k] + eff[k] * m, -1, 1)
       let moodDelta = eff[k] * m * moodRatio
-      // v2.1 反自激限幅：纯内部 L2 活动（日记/自发联想/欲望）对底色 mood.p 的单日累计改变量封顶 ±0.05
+      // v2.1 & P1-AFF-04 反自激限幅：纯内部 L2 活动对底色 mood.p 的单日累计改变量持久化封顶 ±0.05
       if (isInternal && k === 'p') {
-        const used = this.dailyInternalMoodDelta.get(dayKey) ?? 0
-        const nextUsed = clamp(used + moodDelta, -MAX_DAILY_INTERNAL_MOOD_DELTA, MAX_DAILY_INTERNAL_MOOD_DELTA)
-        moodDelta = nextUsed - used
-        this.dailyInternalMoodDelta.set(dayKey, nextUsed)
+        moodDelta = this.applyPersistentL2MoodDelta(s, moodDelta, now)
       }
       s.mood[k] = clamp(s.mood[k] + moodDelta, -1, 1)
       applied[k] = Number((s.pad[k] - before).toFixed(3))
@@ -272,7 +278,8 @@ export class BodyEngine {
           const dv = act.effects.pad[k]
           if (typeof dv === 'number') {
             s.pad[k] = clamp(s.pad[k] + dv, -1, 1)
-            s.mood[k] = clamp(s.mood[k] + dv * 0.25, -1, 1)
+            const moodDelta = k === 'p' ? this.applyPersistentL2MoodDelta(s, dv * 0.25, now) : dv * 0.25
+            s.mood[k] = clamp(s.mood[k] + moodDelta, -1, 1)
           }
         }
       }

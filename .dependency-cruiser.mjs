@@ -9,6 +9,16 @@ export default {
       to: { path: '^src/(llm|tools|transport|admin|storage|app\\.ts|rhythm\\.ts|start\\.ts)' },
     },
     {
+      name: 'soul-shared-no-builtin-io',
+      comment: 'P1-ARCH-01：soul/shared 严禁直接导入 Node 内置文件系统/网络/子进程/数据库 I/O 模块',
+      severity: 'error',
+      from: { path: '^src/(soul|shared)' },
+      to: {
+        dependencyTypes: ['core'],
+        path: '^(node:)?(fs|fs/promises|child_process|http|https|http2|net|tls|dns|dgram|sqlite|worker_threads)$',
+      },
+    },
+    {
       name: 'no-circular',
       comment: '严格禁止循环依赖（0 容忍）',
       severity: 'error',

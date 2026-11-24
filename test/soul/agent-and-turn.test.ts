@@ -1,8 +1,8 @@
 import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { SqliteSoulStore } from '../../src/storage/sqlite-store.ts'
-import { loadPersonaPack } from '../../src/soul/persona/pack.ts'
+import { loadPersonaPack } from '../../src/storage/persona-loader.ts'
 import { Soul } from '../../src/soul/index.ts'
 import { InMemoryToolRegistry, registerSelfExplorationTools } from '../../src/tools/registry.ts'
 import type { ChatModel, ChatRequest, ChatResponse } from '../../src/shared/ports.ts'
@@ -10,7 +10,7 @@ import type { ChatModel, ChatRequest, ChatResponse } from '../../src/shared/port
 describe('Soul native Agent Loop, Prefix Cache invariant, and unified extraction', () => {
   it('loads Nahida PersonaPack + activities, runs native tool loop, folds raw tool output, and keeps static system byte-identical', async () => {
     const store = new SqliteSoulStore(':memory:')
-    const persona = loadPersonaPack(resolve('c:/Files/work/qq-bot/zySoulbot/personas/nahida'))
+    const persona = loadPersonaPack(fileURLToPath(new URL('../../personas/nahida', import.meta.url)))
     assert.ok(persona.activities.length >= 8)
     assert.ok(persona.staticSystemPrompt.includes('纳西妲'))
 

@@ -1,8 +1,17 @@
-// 隔离工作区工具 + 自造 Skill 自检登记 + 原生凭证工具（全属 create 层，受路径沙箱与灾难命令硬护栏保护）。
-import { execFile } from 'node:child_process'
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+// 隔离工作区工具 + 自造 Skill 自检登记 + 原生凭证工具（全属 create 层，受路径/符号链接沙箱、默认禁执行门控与灾难命令硬护栏保护）。
+import { spawn } from 'node:child_process'
+import {
+  closeSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  writeFileSync,
+} from 'node:fs'
 import { dirname, join, relative, resolve, sep } from 'node:path'
-import { promisify } from 'node:util'
 import { z } from 'zod'
 import type { RegisteredTool, SoulStore, ToolRunContext } from '../shared/ports.ts'
 import { nowLocal } from '../shared/time.ts'
@@ -10,7 +19,20 @@ import { CredFieldSchema } from '../soul/governance/credentials.ts'
 import type { CredentialStore } from '../soul/governance/credentials.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
 
-const execFileAsync = promisify(execFile)
+const MAX_READ_BYTES = 256 * 1024
+const SAFE_ENV_KEYS = new Set([
+  'PATH',
+  'HOME',
+  'USERPROFILE',
+  'TEMP',
+  'TMP',
+  'LANG',
+  'LC_ALL',
+  'SYSTEMROOT',
+  'COMSPEC',
+  'PATHEXT',
+  'NODE_ENV',
+])
 
 // 灾难命令硬护栏（代码层不可绕过）
 const DISASTER_COMMANDS: RegExp[] = [
@@ -29,15 +51,102 @@ export function isDangerousCommand(cmd: string): boolean {
   return DISASTER_COMMANDS.some((re) => re.test(cmd))
 }
 
-// 严格路径沙箱：只允许访问 workspaceRoot 内部路径
+function isWithinRoot(realRoot: string, candidate: string): boolean {
+  const rel = relative(realRoot, candidate)
+  if (!rel) return true
+  return !rel.startsWith('..') && !rel.includes(`..${sep}`) && !(resolve(rel) === rel)
+}
+
+// 严格路径 + 符号链接沙箱（P1-SEC-03）：
+// 1. 禁止空字节与越界相对路径
+// 2. 逐级检查已有路径分量，任一分量为符号链接即拒绝
+// 3. 对最深已有祖先做 realpathSync 二次边界核验
 export function safeResolveInWorkspace(workspaceRoot: string, relPath: string): string | null {
-  const root = resolve(workspaceRoot)
-  const target = resolve(root, relPath)
-  const rel = relative(root, target)
-  if (rel.startsWith('..') || rel.includes(`..${sep}`) || resolve(rel) === rel && rel !== '') {
-    return null
+  if (!relPath || relPath.includes('\0')) return null
+  const absRoot = resolve(workspaceRoot)
+  const realRoot = existsSync(absRoot) ? realpathSync(absRoot) : absRoot
+  const target = resolve(realRoot, relPath)
+  if (!isWithinRoot(realRoot, target)) return null
+
+  const rel = relative(realRoot, target)
+  const parts = rel ? rel.split(sep).filter(Boolean) : []
+  let cur = realRoot
+  let deepestExisting = realRoot
+  for (const part of parts) {
+    cur = join(cur, part)
+    if (!existsSync(cur)) {
+      // 检查是否悬空符号链接（existsSync 对悬空 symlink 返回 false，但 lstatSync 存在）
+      try {
+        if (lstatSync(cur).isSymbolicLink()) return null
+      } catch {
+        // 确实不存在
+      }
+      break
+    }
+    try {
+      if (lstatSync(cur).isSymbolicLink()) return null
+    } catch {
+      return null
+    }
+    deepestExisting = cur
+  }
+  if (existsSync(deepestExisting)) {
+    try {
+      const realDeepest = realpathSync(deepestExisting)
+      if (!isWithinRoot(realRoot, realDeepest)) return null
+    } catch {
+      return null
+    }
   }
   return target
+}
+
+function readUtf8Bounded(filePath: string, maxBytes: number): { ok: true; text: string; truncated: boolean } | { ok: false; error: string } {
+  const st = lstatSync(filePath)
+  if (st.isSymbolicLink() || !st.isFile()) {
+    return { ok: false, error: '只能读取工作区内的普通文件。' }
+  }
+  if (st.size > maxBytes * 4) {
+    return { ok: false, error: `文件过大（${st.size} 字节），超出安全读取上限。` }
+  }
+  const fd = openSync(filePath, 'r')
+  try {
+    const toRead = Math.min(st.size, maxBytes)
+    const buf = Buffer.allocUnsafe(toRead)
+    let offset = 0
+    while (offset < toRead) {
+      const n = readSync(fd, buf, offset, toRead - offset, offset)
+      if (n <= 0) break
+      offset += n
+    }
+    return { ok: true, text: buf.subarray(0, offset).toString('utf8'), truncated: st.size > maxBytes }
+  } finally {
+    closeSync(fd)
+  }
+}
+
+function buildMinimalEnv(extra?: Record<string, string>): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {}
+  for (const [k, v] of Object.entries(process.env)) {
+    if (v !== undefined && SAFE_ENV_KEYS.has(k.toUpperCase())) env[k] = v
+  }
+  if (extra) Object.assign(env, extra)
+  return env
+}
+
+function scrubSecrets(text: string, credentials: CredentialStore): string {
+  if (!text) return text
+  let out = text
+  const secrets = credentials.listSecretValues()
+  for (const s of secrets) {
+    if (s.length < 4) continue
+    out = out.split(s).join('[REDACTED_SECRET]')
+    const b64 = Buffer.from(s, 'utf8').toString('base64')
+    if (b64.length >= 6) out = out.split(b64).join('[REDACTED_SECRET]')
+    const uri = encodeURIComponent(s)
+    if (uri !== s && uri.length >= 6) out = out.split(uri).join('[REDACTED_SECRET]')
+  }
+  return out
 }
 
 const ListArgsSchema = z.object({
@@ -87,17 +196,57 @@ async function runShellCommand(
   const isWin = process.platform === 'win32'
   const bin = isWin ? 'powershell.exe' : '/bin/sh'
   const args = isWin ? ['-NoProfile', '-NonInteractive', '-Command', command] : ['-c', command]
-  try {
-    const res = await execFileAsync(bin, args, { cwd, env, timeout: timeoutMs, maxBuffer: 512 * 1024 })
-    return { stdout: String(res.stdout ?? ''), stderr: String(res.stderr ?? ''), exitCode: 0 }
-  } catch (e) {
-    const err = e as { stdout?: string; stderr?: string; code?: number; message?: string }
-    return {
-      stdout: String(err.stdout ?? ''),
-      stderr: String(err.stderr ?? err.message ?? ''),
-      exitCode: typeof err.code === 'number' ? err.code : 1,
+  const maxBytes = 256 * 1024
+
+  return new Promise((resolveRun) => {
+    const child = spawn(bin, args, {
+      cwd,
+      env,
+      detached: !isWin,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+    let stdout = ''
+    let stderr = ''
+    let settled = false
+    let timedOut = false
+
+    const finish = (exitCode: number): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolveRun({ stdout, stderr: timedOut ? `${stderr}\n[timeout]`.trim() : stderr, exitCode })
     }
-  }
+
+    const killTree = (): void => {
+      if (!child.pid) return
+      try {
+        if (!isWin) process.kill(-child.pid, 'SIGKILL')
+        else child.kill('SIGKILL')
+      } catch {
+        try { child.kill('SIGKILL') } catch { /* ignore */ }
+      }
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      killTree()
+      finish(124)
+    }, timeoutMs)
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (stdout.length < maxBytes) stdout += chunk.toString('utf8').slice(0, maxBytes - stdout.length)
+    })
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (stderr.length < maxBytes) stderr += chunk.toString('utf8').slice(0, maxBytes - stderr.length)
+    })
+    child.on('error', (err) => {
+      stderr += err.message
+      finish(1)
+    })
+    child.on('close', (code) => {
+      finish(typeof code === 'number' ? code : 1)
+    })
+  })
 }
 
 export function registerWorkspaceTools(
@@ -108,12 +257,17 @@ export function registerWorkspaceTools(
     credentials: CredentialStore
     /** P0-3 执行层门控（Mask, Don't Remove）：冻结 tools 数组保 Prefix Cache，在执行时拦截非授权调用 */
     allowCreate?: (ctx: ToolRunContext) => boolean
+    /** P0-SEC-01：默认关闭未沙箱化的本机命令执行，仅显式开启后放行 */
+    allowUnsafeLocalExec?: boolean
+    /** 仅当确需向受信任脚本暴露凭证路径时显式开启（默认 false，防止脚本外泄密文） */
+    injectCredentialsPath?: boolean
     onCredentialRequested?: (credName: string) => void
   },
 ): void {
   const root = resolve(deps.workspaceDir)
   mkdirSync(root, { recursive: true })
   mkdirSync(join(root, 'skills'), { recursive: true })
+  const allowExec = Boolean(deps.allowUnsafeLocalExec)
 
   const registerGuarded = (tool: RegisteredTool): void => {
     registry.register({
@@ -140,13 +294,21 @@ export function registerWorkspaceTools(
     async execute(args) {
       const { dir } = ListArgsSchema.parse(args)
       const target = safeResolveInWorkspace(root, dir)
-      if (!target) return { output: '不能访问工作区以外的目录。', isError: true }
+      if (!target) return { output: '不能访问工作区以外或符号链接目录。', isError: true }
       if (!existsSync(target)) return { output: `目录不存在：${dir}` }
-      const entries = readdirSync(target).slice(0, 80).map((name) => {
+      const st = lstatSync(target)
+      if (st.isSymbolicLink() || !st.isDirectory()) return { output: '目标不是普通目录。', isError: true }
+      const entries: string[] = []
+      for (const name of readdirSync(target).slice(0, 80)) {
         const full = join(target, name)
-        const isDir = statSync(full).isDirectory()
-        return isDir ? `${name}/` : name
-      })
+        try {
+          const itemStat = lstatSync(full)
+          if (itemStat.isSymbolicLink()) continue
+          entries.push(itemStat.isDirectory() ? `${name}/` : name)
+        } catch {
+          // 忽略不可访问项
+        }
+      }
       return {
         output: entries.length ? entries.join('\n') : '（空目录）',
         foldSummary: `查看工作区 ${dir}（${entries.length} 项）`,
@@ -168,11 +330,12 @@ export function registerWorkspaceTools(
     async execute(args) {
       const { path } = ReadArgsSchema.parse(args)
       const target = safeResolveInWorkspace(root, path)
-      if (!target) return { output: '不能读取工作区以外的文件。', isError: true }
+      if (!target) return { output: '不能读取工作区以外或符号链接文件。', isError: true }
       if (!existsSync(target)) return { output: `文件不存在：${path}`, isError: true }
-      const content = readFileSync(target, 'utf8')
+      const res = readUtf8Bounded(target, MAX_READ_BYTES)
+      if (!res.ok) return { output: res.error, isError: true }
       return {
-        output: content.slice(0, 2400),
+        output: res.text.slice(0, 2400),
         foldSummary: `读取文件 ${path}`,
       }
     },
@@ -195,8 +358,18 @@ export function registerWorkspaceTools(
     async execute(args) {
       const { path, content } = WriteArgsSchema.parse(args)
       const target = safeResolveInWorkspace(root, path)
-      if (!target) return { output: '不能写入工作区以外的路径。', isError: true }
+      if (!target) return { output: '不能写入工作区以外或符号链接路径。', isError: true }
+      if (existsSync(target)) {
+        const st = lstatSync(target)
+        if (st.isSymbolicLink() || !st.isFile()) {
+          return { output: '目标不是可写普通文件。', isError: true }
+        }
+      }
       mkdirSync(dirname(target), { recursive: true })
+      // 创建父目录后再次校验真实路径，防竞态符号链接
+      if (!safeResolveInWorkspace(root, path)) {
+        return { output: '写入前路径二次校验未通过。', isError: true }
+      }
       writeFileSync(target, content, 'utf8')
       return {
         output: `已写入 ${path}（${content.length} 字符）。`,
@@ -221,17 +394,23 @@ export function registerWorkspaceTools(
     },
     async execute(args) {
       const { command, timeoutSec } = RunArgsSchema.parse(args)
+      if (!allowExec) {
+        return {
+          output: '当前未启用受控隔离执行环境，本机命令执行默认关闭（可在配置显式开启 allowUnsafeLocalExec）。',
+          isError: true,
+        }
+      }
       if (isDangerousCommand(command)) {
         return { output: '该命令命中系统安全护栏，已被拒绝执行。', isError: true }
       }
-      const env: NodeJS.ProcessEnv = {
-        ...process.env,
-        ZYSOUL_CREDENTIALS: resolve(deps.credentials.path),
-      }
+      const extraEnv = deps.injectCredentialsPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
+      const env = buildMinimalEnv(extraEnv)
       const res = await runShellCommand(command, root, env, timeoutSec * 1000)
+      const safeOut = scrubSecrets(res.stdout.trim(), deps.credentials)
+      const safeErr = scrubSecrets(res.stderr.trim(), deps.credentials)
       const combined = [
-        res.stdout ? `STDOUT:\n${res.stdout.trim()}` : '',
-        res.stderr ? `STDERR:\n${res.stderr.trim()}` : '',
+        safeOut ? `STDOUT:\n${safeOut}` : '',
+        safeErr ? `STDERR:\n${safeErr}` : '',
       ].filter(Boolean).join('\n')
       return {
         output: `exit=${res.exitCode}\n${combined || '（无输出）'}`.slice(0, 2400),
@@ -259,18 +438,27 @@ export function registerWorkspaceTools(
     async execute(args, ctx) {
       const { name, summary, verifyCommand } = RegisterSkillArgsSchema.parse(args)
       const skillDir = safeResolveInWorkspace(root, join('skills', name))
-      if (!skillDir || !existsSync(join(skillDir, 'SKILL.md'))) {
+      const skillMd = safeResolveInWorkspace(root, join('skills', name, 'SKILL.md'))
+      if (!skillDir || !skillMd || !existsSync(skillMd)) {
         return { output: `登记失败：找不到 skills/${name}/SKILL.md，请先写好技能说明文件。`, isError: true }
       }
       if (verifyCommand) {
+        if (!allowExec) {
+          return {
+            output: '当前未启用受控隔离执行环境，拒绝带执行命令的技能自检（请移除 verifyCommand 或显式开启 allowUnsafeLocalExec）。',
+            isError: true,
+          }
+        }
         if (isDangerousCommand(verifyCommand)) {
           return { output: '自检命令命中安全护栏，已被拒绝。', isError: true }
         }
-        const env: NodeJS.ProcessEnv = { ...process.env, ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) }
+        const extraEnv = deps.injectCredentialsPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
+        const env = buildMinimalEnv(extraEnv)
         const check = await runShellCommand(verifyCommand, skillDir, env, 20_000)
         if (check.exitCode !== 0) {
+          const safeMsg = scrubSecrets(check.stderr || check.stdout, deps.credentials)
           return {
-            output: `技能自检未通过（exit=${check.exitCode}）：${(check.stderr || check.stdout).slice(0, 400)}`,
+            output: `技能自检未通过（exit=${check.exitCode}）：${safeMsg.slice(0, 400)}`,
             isError: true,
           }
         }

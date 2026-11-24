@@ -19,6 +19,8 @@ export interface AdminBotContext {
   singing: SingingPort | null
   transport: TransportPort | null
   reloadPersona(): void
+  /** P1-STATE-04：将后台状态写操作串行排入单 Bot 队列，避免与进行中的异步任务竞态覆盖 */
+  runSerialized<T>(fn: () => Promise<T> | T): Promise<T>
 }
 
 export interface AdminContext {
@@ -26,6 +28,7 @@ export interface AdminContext {
   authFilePath: string
   webDistDir?: string
   initialPassword?: string
+  trustProxy?: boolean
   clock?: Clock
   getBot(id: string): AdminBotContext | undefined
 }

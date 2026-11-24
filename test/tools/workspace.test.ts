@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SqliteSoulStore } from '../../src/storage/sqlite-store.ts'
-import { CredentialStore } from '../../src/soul/governance/credentials.ts'
+import { CredentialStore } from '../../src/storage/credentials-store.ts'
 import { InMemoryToolRegistry } from '../../src/tools/registry.ts'
 import { isDangerousCommand, registerWorkspaceTools, safeResolveInWorkspace } from '../../src/tools/workspace.ts'
 
@@ -33,6 +33,8 @@ describe('Workspace sandbox, self-verifying skills, and credential tools', () =>
         workspaceDir: join(dir, 'workspace'),
         store,
         credentials,
+        allowUnsafeLocalExec: true,
+        injectCredentialsPath: true,
         onCredentialRequested: (name) => requested.push(name),
       })
       const ctx = { botId: 'nahida', threadKey: 'solo:1', userId: '1', userName: '追夜', isGroup: false, solo: true, now: new Date() }

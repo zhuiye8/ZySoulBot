@@ -69,7 +69,7 @@ export interface BuildScopeVerdict {
 
 export function checkBuildScope(
   desire: DesireRecord,
-  opts: { autonomyEnabled?: boolean } = {},
+  opts: { autonomyEnabled?: boolean; now?: Date } = {},
 ): BuildScopeVerdict {
   const specText = desire.spec ? JSON.stringify(desire.spec) : ''
   const blob = `${desire.want} ${desire.why} ${specText}`
@@ -80,7 +80,18 @@ export function checkBuildScope(
     }
   }
 
-  if (opts.autonomyEnabled === false) {
+  // P1-STATE-05：拒绝后进入明确冷静期，不再反复要求批准
+  const nowMs = (opts.now ?? new Date()).getTime()
+  if (desire.rejectedUntil) {
+    const untilMs = Date.parse(desire.rejectedUntil.replace(' ', 'T'))
+    if (Number.isFinite(untilMs) && untilMs > nowMs) {
+      return { allowed: false, hardBlocked: false, needsApproval: false, requiresCredential: false, reason: 'rejected_cooldown' }
+    }
+  }
+
+  // P1-STATE-05：若管理员已对当前任务授予一次性批准（approvedPlanVersion >= 1），放行不再被全局开关阻挡
+  const hasExplicitApproval = typeof desire.approvedPlanVersion === 'number' && desire.approvedPlanVersion >= 1
+  if (opts.autonomyEnabled === false && !hasExplicitApproval) {
     return { allowed: false, hardBlocked: false, needsApproval: true, requiresCredential: false, reason: 'autonomy_off' }
   }
 
@@ -146,6 +157,35 @@ export class DesireEngine {
     return this.store.listDesires(ACTIVE_STAGES)
   }
 
+  save(desire: DesireRecord): void {
+    this.store.upsertDesire(desire)
+  }
+
+  // P1-STATE-01：进程重启或异常中断后恢复遗留的 in_progress 任务，避免永久卡死占用名额
+  recoverInterrupted(now: Date = new Date(), inFlightIds: ReadonlySet<string> = new Set()): DesireRecord[] {
+    const stamp = nowLocal(now)
+    const nowMs = now.getTime()
+    const recovered: DesireRecord[] = []
+    for (const d of this.store.listDesires(['in_progress'])) {
+      if (inFlightIds.has(d.id)) continue
+      const progressRef = Date.parse((d.lastProgressAt ?? d.createdAt).replace(' ', 'T'))
+      const ageMs = Number.isFinite(progressRef) ? Math.max(0, nowMs - progressRef) : 0
+      if (ageMs > this.ttlMs) {
+        d.stage = 'faded'
+        d.progressNote = '上次推进中断且已过时效，自然淡去'
+      } else {
+        d.stage = 'active'
+        d.progressNote = d.exitKind === 'build_skill'
+          ? '上次推进意外中断，需先核查已有工作区产物后再续接'
+          : '上次推进意外中断，待空闲时续接'
+      }
+      d.updatedAt = stamp
+      this.store.upsertDesire(d)
+      recovered.push(d)
+    }
+    return recovered
+  }
+
   // 种下或合并一条念头（硬拦讨好型动机，语义近似则合并增强）
   seed(inp: {
     source: DesireRecord['source']
@@ -172,6 +212,7 @@ export class DesireEngine {
       existing.thoughtCount += 1
       existing.strength = Math.min(1, Math.max(existing.strength, inp.strength ?? 0.5) + 0.06)
       existing.why = why || existing.why
+      existing.lastProgressAt = stamp
       existing.updatedAt = stamp
       this.store.upsertDesire(existing)
       return existing
@@ -208,6 +249,7 @@ export class DesireEngine {
       progressNote: null,
       aboutUser: inp.aboutUser ?? null,
       parentId: inp.parentId ?? null,
+      lastProgressAt: stamp,
       createdAt: stamp,
       updatedAt: stamp,
     }
@@ -215,23 +257,26 @@ export class DesireEngine {
     return rec
   }
 
-  // 双向时间演化：一直压着没机会做的慢慢变强；被拒/久放不动的慢慢淡去。
+  // P1-STATE-01 双向时间演化：分离真实进展时间（lastProgressAt）与 tick 时间（updatedAt），
+  // 任何阶段超过 ttlMs 无真实推进都会自然淡去，绝不被定时 tick 无限续命！
   tick(now: Date = new Date()): number {
     let changed = 0
     const nowMs = now.getTime()
     const stamp = nowLocal(now)
     for (const d of this.active()) {
-      const updatedMs = Date.parse(d.updatedAt.replace(' ', 'T'))
-      const ageMs = Number.isFinite(updatedMs) ? Math.max(0, nowMs - updatedMs) : 0
-      if (ageMs > this.ttlMs) {
+      const progressMs = Date.parse((d.lastProgressAt ?? d.createdAt).replace(' ', 'T'))
+      const progressAgeMs = Number.isFinite(progressMs) ? Math.max(0, nowMs - progressMs) : 0
+      if (progressAgeMs > this.ttlMs) {
         d.stage = 'faded'
-        d.progressNote = '这些天没再想起，慢慢淡了'
+        d.progressNote = '这些天没有实质推进，慢慢淡了'
         d.updatedAt = stamp
         this.store.upsertDesire(d)
         changed += 1
         continue
       }
-      const days = ageMs / 86_400_000
+      const tickMs = Date.parse(d.updatedAt.replace(' ', 'T'))
+      const tickAgeMs = Number.isFinite(tickMs) ? Math.max(0, nowMs - tickMs) : 0
+      const days = tickAgeMs / 86_400_000
       if (days < 0.5) continue
 
       if (d.stage === 'waiting_approval' || d.stage === 'waiting_credential') {
@@ -240,6 +285,9 @@ export class DesireEngine {
       } else if (d.stage === 'active' || d.stage === 'seed') {
         // 心里一直压着没机会做 → 慢慢变重（上限 1）
         d.strength = Math.min(1, Number((d.strength + 0.1 * days).toFixed(3)))
+      } else {
+        // in_progress 不做强度涨跌，也不刷新 lastProgressAt
+        continue
       }
       d.updatedAt = stamp
       this.store.upsertDesire(d)
@@ -252,13 +300,15 @@ export class DesireEngine {
   resumeReadyCredentials(isReady: (credName: string) => boolean, now: Date = new Date()): DesireRecord[] {
     const waiting = this.store.listDesires(['waiting_credential'])
     const resumed: DesireRecord[] = []
+    const stamp = nowLocal(now)
     for (const d of waiting) {
       const credName = typeof d.blocker?.payload?.credName === 'string' ? d.blocker.payload.credName : ''
       if (!credName || !isReady(credName)) continue
       d.stage = 'active'
       d.blocker = null
       d.progressNote = `需要的凭证「${credName}」已经填好了，可以接着做`
-      d.updatedAt = nowLocal(now)
+      d.lastProgressAt = stamp
+      d.updatedAt = stamp
       this.store.upsertDesire(d)
       resumed.push(d)
     }

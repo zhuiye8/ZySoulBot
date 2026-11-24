@@ -62,7 +62,7 @@ export function createAdminApp(ctx: AdminContext): AdminAppBundle {
     await next()
   })
 
-  registerAuthRoutes(app, auth)
+  registerAuthRoutes(app, auth, { trustProxy: ctx.trustProxy })
   registerOverviewRoutes(app, ctx)
   registerLifeRoutes(app, ctx)
   registerMemoryRoutes(app, ctx)

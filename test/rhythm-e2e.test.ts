@@ -3,7 +3,8 @@ import assert from 'node:assert/strict'
 import { EventEmitter } from 'node:events'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
 import { ZysoulConfigSchema } from '../src/shared/config.ts'
 import { createApp } from '../src/app.ts'
@@ -162,11 +163,11 @@ describe('P2 Rhythm E2E (Desire -> Credential Wait -> Resume -> Build & Verify +
       bots: [{
         id: 'nahida',
         dataDir: tempDir,
-        personaDir: resolve('c:/Files/work/qq-bot/zySoulbot/personas/nahida'),
+        personaDir: fileURLToPath(new URL('../personas/nahida', import.meta.url)),
         selfId: '3164305169',
         napcatWs: 'ws://127.0.0.1:3003',
         access: { users: ['1563359387'], groups: [], admins: ['1563359387'] },
-        proactivity: { enabled: true, allowlist: ['1563359387'], autonomyBuildEnabled: true },
+        proactivity: { enabled: true, allowlist: ['1563359387'], autonomyBuildEnabled: true, allowUnsafeLocalExec: true },
       }],
     })
 

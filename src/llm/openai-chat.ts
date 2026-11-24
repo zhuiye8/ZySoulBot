@@ -29,6 +29,7 @@ function serializeMessage(m: ChatMessage): Record<string, unknown> {
     return {
       role: 'assistant',
       content: m.content || null,
+      ...(m.reasoningContent !== undefined ? { reasoning_content: m.reasoningContent } : {}),
       tool_calls: m.toolCalls.map((tc) => ({
         id: tc.id,
         type: 'function',
@@ -137,6 +138,7 @@ export function createOpenAIChatModel(opts: OpenAIChatOptions): ChatModel {
               finish_reason?: string
               message?: {
                 content?: string | null
+                reasoning_content?: string | null
                 tool_calls?: Array<{ id?: string; function?: { name?: string; arguments?: string } }>
               }
             }>
@@ -167,6 +169,9 @@ export function createOpenAIChatModel(opts: OpenAIChatOptions): ChatModel {
             finishReason,
             usage: parseUsage(data.usage),
             model: String(data.model || opts.model),
+            ...(typeof choice.message.reasoning_content === 'string'
+              ? { reasoningContent: choice.message.reasoning_content }
+              : {}),
           }
         } catch (e) {
           if (e instanceof SoulError) throw e

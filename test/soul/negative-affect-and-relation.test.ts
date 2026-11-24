@@ -10,7 +10,7 @@ import { isTrivialMessage } from '../../src/soul/conversation/turn.ts'
 import { decideAttention } from '../../src/soul/conversation/attention.ts'
 import { decideGroupChime } from '../../src/soul/conversation/group.ts'
 import { collectSocialMotives } from '../../src/soul/desire/life.ts'
-import { StickerLibrary } from '../../src/soul/expression/stickers.ts'
+import { StickerLibrary } from '../../src/storage/sticker-store.ts'
 import type { ChatModel } from '../../src/shared/ports.ts'
 
 test('isTrivialMessage never skips cold/dismissive/hostile short words while keeping benign skips', () => {

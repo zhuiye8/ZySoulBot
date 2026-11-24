@@ -76,6 +76,7 @@ export class Soul {
         body: this.body,
         memory: this.memory,
         relations: this.relations,
+        desires: this.desires,
         chatModel: this.chatModel,
         auxModel: this.auxModel,
         tools: this.tools,

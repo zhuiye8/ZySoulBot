@@ -1,9 +1,13 @@
-// 外部服务凭证库（data/credentials.json，0600 权限，原子写，无缓存防双端写过期）。
+// 外部服务凭证纯领域逻辑（零文件系统 I/O，持久化适配见 src/storage/credentials-store.ts）。
 // 关键约定：填了就是同意。密钥绝不经过聊天记录；她登记需要、管理员在后台填、她的工具按名取值。
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
 import { z } from 'zod'
 import { nowLocal } from '../../shared/time.ts'
+
+export interface CredentialFileBackend {
+  readonly path: string
+  readText(): string | null
+  writeText(content: string): void
+}
 
 export const CredFieldSchema = z.object({
   key: z.string().min(1).max(40),
@@ -34,7 +38,7 @@ export interface CredFilled {
   filledAt: string
 }
 
-interface CredFileData {
+export interface CredFileData {
   needs: Record<string, CredNeed>
   filled: Record<string, CredFilled>
 }
@@ -55,15 +59,18 @@ export function normalizeCredFields(raw: unknown): CredField[] {
 
 export class CredentialStore {
   readonly path: string
+  private backend: CredentialFileBackend
 
-  constructor(filePath: string) {
-    this.path = filePath
+  constructor(backend: CredentialFileBackend) {
+    this.backend = backend
+    this.path = backend.path
   }
 
   private load(): CredFileData {
-    if (!existsSync(this.path)) return { needs: {}, filled: {} }
+    const txt = this.backend.readText()
+    if (!txt) return { needs: {}, filled: {} }
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8')) as Partial<CredFileData>
+      const raw = JSON.parse(txt) as Partial<CredFileData>
       const needs: Record<string, CredNeed> = {}
       for (const [k, v] of Object.entries(raw.needs ?? {})) {
         if (!v || typeof v !== 'object') continue
@@ -76,10 +83,7 @@ export class CredentialStore {
   }
 
   private save(data: CredFileData): void {
-    mkdirSync(dirname(this.path), { recursive: true })
-    const tmp = `${this.path}.tmp`
-    writeFileSync(tmp, JSON.stringify(data, null, 2), { encoding: 'utf8', mode: 0o600 })
-    renameSync(tmp, this.path)
+    this.backend.writeText(JSON.stringify(data, null, 2))
   }
 
   listNeeds(): CredNeed[] {
@@ -127,6 +131,23 @@ export class CredentialStore {
 
   getValues(name: string): Record<string, string> | null {
     return this.load().filled[name]?.values ?? null
+  }
+
+  /** 供命令输出脱敏使用：返回所有已填 secret 字段值（绝不直接暴露给 LLM） */
+  listSecretValues(): string[] {
+    const d = this.load()
+    const out: string[] = []
+    for (const [name, filled] of Object.entries(d.filled)) {
+      const need = d.needs[name]
+      const secretKeys = new Set(
+        (need?.fields ?? []).filter((f) => f.type === 'secret').map((f) => f.key),
+      )
+      for (const [k, v] of Object.entries(filled.values)) {
+        if (!v) continue
+        if (secretKeys.size === 0 || secretKeys.has(k)) out.push(v)
+      }
+    }
+    return out
   }
 
   // 登记或更新外部服务凭证需求；换供应商时自动作废旧密钥。

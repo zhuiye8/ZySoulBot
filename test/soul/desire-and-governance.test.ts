@@ -2,13 +2,14 @@ import { describe, it } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join, resolve } from 'node:path'
+import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { SqliteSoulStore } from '../../src/storage/sqlite-store.ts'
-import { loadPersonaPack } from '../../src/soul/persona/pack.ts'
+import { loadPersonaPack } from '../../src/storage/persona-loader.ts'
 import { BodyEngine } from '../../src/soul/body/engine.ts'
 import { checkBuildScope, DesireEngine } from '../../src/soul/desire/engine.ts'
 import { lifeRoll } from '../../src/soul/desire/life.ts'
-import { CredentialStore } from '../../src/soul/governance/credentials.ts'
+import { CredentialStore } from '../../src/storage/credentials-store.ts'
 import { ApprovalManager, isApprovalGranted } from '../../src/soul/governance/approval.ts'
 import { checkAutonomousBudget, inQuietHours } from '../../src/soul/governance/budget.ts'
 import type { ChatModel, ChatResponse } from '../../src/shared/ports.ts'
@@ -88,7 +89,7 @@ describe('DesireEngine (dedup, bidirectional tick, scope routing, shaping, mind 
 
   it('shapes seeds in one pass and sparks unprompted thoughts via mindWander', async () => {
     const store = new SqliteSoulStore(':memory:')
-    const persona = loadPersonaPack(resolve('c:/Files/work/qq-bot/zySoulbot/personas/nahida'))
+    const persona = loadPersonaPack(fileURLToPath(new URL('../../personas/nahida', import.meta.url)))
     const body = new BodyEngine(store)
     const desires = new DesireEngine(store)
     try {

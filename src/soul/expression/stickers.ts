@@ -1,7 +1,5 @@
-// 表情包领域库（按 bot 隔离）：manifest 热加载 + 情绪匹配 + 频控/去重 + 陌生人负面收敛。
-// 零外部依赖；不解析回复正文里的假指令——由表达层原生工具 send_sticker 主动调用。
-import { existsSync, mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+// 表情包纯领域库（零文件系统 I/O，文件存储适配见 src/storage/sticker-store.ts）：情绪匹配 + 频控/去重 + 陌生人负面收敛。
+// 不解析回复正文里的假指令——由表达层原生工具 send_sticker 主动调用。
 import type { AffectKind } from '../../shared/ports.ts'
 
 export interface StickerMeta {
@@ -30,6 +28,15 @@ export interface StickerLibraryOptions {
   random?: () => number
 }
 
+export interface StickerStorageBackend {
+  readonly dir: string
+  readonly manifestPath: string
+  getMtime(): number
+  readManifest(): StickerMeta[]
+  writeManifest(items: StickerMeta[]): void
+  resolveFile(file: string): string
+}
+
 interface RouteState {
   recentKeys: string[]
   lastKind: string
@@ -44,14 +51,16 @@ export class StickerLibrary {
   readonly dir: string
   readonly manifestPath: string
   readonly opts: Required<Omit<StickerLibraryOptions, 'random'>>
+  private backend: StickerStorageBackend
   private random: () => number
   private items: StickerMeta[] = []
   private mtime = 0
   private routes = new Map<string, RouteState>()
 
-  constructor(dir: string, opts: StickerLibraryOptions = {}) {
-    this.dir = dir
-    this.manifestPath = join(dir, 'manifest.json')
+  constructor(backend: StickerStorageBackend, opts: StickerLibraryOptions = {}) {
+    this.backend = backend
+    this.dir = backend.dir
+    this.manifestPath = backend.manifestPath
     this.opts = {
       cooldownTurns: opts.cooldownTurns ?? 3,
       cooldownMs: opts.cooldownMs ?? 60_000,
@@ -63,28 +72,15 @@ export class StickerLibrary {
   }
 
   reload(): void {
-    if (!existsSync(this.manifestPath)) {
+    const mt = this.backend.getMtime()
+    if (mt === 0) {
       this.items = []
       this.mtime = 0
       return
     }
-    let mt = 0
-    try {
-      mt = statSync(this.manifestPath).mtimeMs
-    } catch {
-      this.items = []
-      return
-    }
     if (mt === this.mtime) return
     this.mtime = mt
-    try {
-      const parsed = JSON.parse(readFileSync(this.manifestPath, 'utf8')) as { items?: StickerMeta[] }
-      this.items = Array.isArray(parsed.items)
-        ? parsed.items.filter((s) => Boolean(s?.key && s?.file && Array.isArray(s.emotions)))
-        : []
-    } catch {
-      this.items = []
-    }
+    this.items = this.backend.readManifest()
   }
 
   list(): StickerMeta[] {
@@ -108,10 +104,7 @@ export class StickerLibrary {
   }
 
   private save(): void {
-    mkdirSync(dirname(this.manifestPath), { recursive: true })
-    const tmp = `${this.manifestPath}.tmp`
-    writeFileSync(tmp, JSON.stringify({ items: this.items }, null, 2), 'utf8')
-    renameSync(tmp, this.manifestPath)
+    this.backend.writeManifest(this.items)
     this.mtime = 0
   }
 
@@ -175,7 +168,7 @@ export class StickerLibrary {
     return {
       key: picked.key,
       file: picked.file,
-      absPath: join(this.dir, picked.file),
+      absPath: this.backend.resolveFile(picked.file),
       description: picked.description,
     }
   }
