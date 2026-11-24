@@ -3,10 +3,40 @@ import { randomUUID } from 'node:crypto'
 import { classifyHttp, SoulError } from '../shared/errors.ts'
 import { resolveEnvValue } from '../shared/time.ts'
 import type { BotConfig } from '../shared/config.ts'
-import type { TtsPort } from '../shared/ports.ts'
+import type { AffectKind, TtsPort, TtsSynthRequest } from '../shared/ports.ts'
 
 const DEFAULT_TIMEOUT_MS = 90_000
 const MAX_TTS_TEXT = 400
+
+// 不同情绪对应的动态语速与火山豆包 ICL 2.0 语气指令（neutral 回落至各 Bot 配置基线，避免生气也被强套“温柔缓慢”）
+export const EMOTION_PROSODY: Record<Exclude<AffectKind, 'neutral'>, { speechRate: number; contextText: string }> = {
+  conflict: { speechRate: 8, contextText: '语气冷淡克制，带着明显的不高兴和认真生气地说' },
+  annoyed: { speechRate: 6, contextText: '语速偏快干脆，带着一点不耐烦和烦躁地说' },
+  hurt: { speechRate: -15, contextText: '声音轻柔低落，带着明显的委屈和受伤的感觉说' },
+  rejected: { speechRate: -12, contextText: '声音略微低落疏离，带着被推开后的失落感说' },
+  sadness: { speechRate: -16, contextText: '语调低沉缓慢，带着淡淡的难过和叹息说' },
+  guilty: { speechRate: -10, contextText: '声音轻轻的，带着愧疚和不好意思的语气说' },
+  uneasy: { speechRate: -5, contextText: '语气略带犹豫和保持距离的感觉说' },
+  praised: { speechRate: 6, contextText: '语气轻快明朗，带着开心和笑意说' },
+  affection: { speechRate: -4, contextText: '语气柔和温暖，带着亲近和轻声笑意说' },
+  humor: { speechRate: 10, contextText: '语调活泼轻快，带着一点俏皮和笑意说' },
+  curiosity: { speechRate: 8, contextText: '语调明亮上扬，带着好奇和兴致勃勃的感觉说' },
+  boredom: { speechRate: -18, contextText: '声音慵懒轻软，带着一点困意和提不起劲的感觉慢慢说' },
+}
+
+export function resolveVolcProsody(
+  req: TtsSynthRequest,
+  cfg: { speechRate: number; contextTexts?: string[] },
+): { speechRate: number; contextTexts?: string[] } {
+  const customTone = req.tone?.trim()
+  const emo = req.emotion && req.emotion !== 'neutral' ? EMOTION_PROSODY[req.emotion] : null
+  const baseRate = emo ? emo.speechRate : cfg.speechRate
+  const speechRate = Math.max(-50, Math.min(100, Math.round(baseRate + (req.speechRateDelta ?? 0))))
+  const contextTexts = customTone
+    ? [customTone]
+    : (emo ? [emo.contextText] : (cfg.contextTexts?.length ? cfg.contextTexts : undefined))
+  return { speechRate, contextTexts }
+}
 
 export type TtsConfig = NonNullable<BotConfig['tts']>
 
@@ -30,12 +60,13 @@ function createVolcTts(cfg: Extract<TtsConfig, { provider: 'volc' }>, fetchImpl:
   const apiKey = resolveEnvValue(cfg.apiKey)
   return {
     id: 'volc',
-    async synth({ text, signal }) {
+    async synth(req) {
       if (!apiKey) throw new SoulError('auth', 'volc tts api key missing (check ENV variable)')
-      const body = text.trim().slice(0, MAX_TTS_TEXT)
+      const body = req.text.trim().slice(0, MAX_TTS_TEXT)
       if (!body) throw new SoulError('protocol', 'tts text empty')
       const timeout = AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS)
-      const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+      const combined = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout
+      const prosody = resolveVolcProsody(req, cfg)
 
       let res: Response
       try {
@@ -55,9 +86,9 @@ function createVolcTts(cfg: Extract<TtsConfig, { provider: 'volc' }>, fetchImpl:
               audio_params: {
                 format: cfg.format,
                 sample_rate: cfg.sampleRate,
-                speech_rate: Math.max(-50, Math.min(100, cfg.speechRate)),
+                speech_rate: prosody.speechRate,
               },
-              ...(cfg.contextTexts?.length ? { context_texts: cfg.contextTexts } : {}),
+              ...(prosody.contextTexts?.length ? { context_texts: prosody.contextTexts } : {}),
             },
           }),
           signal: combined,
@@ -101,12 +132,15 @@ function createOpenAiTts(cfg: Extract<TtsConfig, { provider: 'openai' }>, fetchI
   const apiKey = resolveEnvValue(cfg.apiKey)
   return {
     id: 'openai-tts',
-    async synth({ text, signal }) {
+    async synth(req) {
       if (!apiKey) throw new SoulError('auth', 'openai tts api key missing (check ENV variable)')
-      const body = text.trim().slice(0, MAX_TTS_TEXT)
+      const body = req.text.trim().slice(0, MAX_TTS_TEXT)
       if (!body) throw new SoulError('protocol', 'tts text empty')
       const timeout = AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS)
-      const combined = signal ? AbortSignal.any([signal, timeout]) : timeout
+      const combined = req.signal ? AbortSignal.any([req.signal, timeout]) : timeout
+      const emo = req.emotion && req.emotion !== 'neutral' ? EMOTION_PROSODY[req.emotion] : null
+      const speedMult = emo ? 1 + emo.speechRate / 200 : 1
+      const speed = Math.max(0.5, Math.min(2.0, Number((cfg.speed * speedMult).toFixed(2))))
 
       let res: Response
       try {
@@ -121,7 +155,7 @@ function createOpenAiTts(cfg: Extract<TtsConfig, { provider: 'openai' }>, fetchI
             voice: cfg.voice,
             input: body,
             response_format: cfg.format,
-            speed: cfg.speed,
+            speed,
           }),
           signal: combined,
         })

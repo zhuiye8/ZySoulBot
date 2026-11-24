@@ -10,6 +10,7 @@ import { pathToFileURL } from 'node:url'
 import { z } from 'zod'
 import { EMOTION_KINDS } from '../shared/ports.ts'
 import type {
+  AffectKind,
   SendTarget,
   SingingPort,
   SoulStore,
@@ -18,6 +19,7 @@ import type {
   TtsPort,
 } from '../shared/ports.ts'
 import { nowLocal } from '../shared/time.ts'
+import type { BodyEngine } from '../soul/body/engine.ts'
 import type { RelationEngine } from '../soul/relation/engine.ts'
 import type { StickerLibrary } from '../soul/expression/stickers.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
@@ -25,6 +27,7 @@ import type { InMemoryToolRegistry } from './registry.ts'
 export interface ExpressionToolsDeps {
   store: SoulStore
   relations: RelationEngine
+  body?: BodyEngine
   getTransport: () => TransportPort | null
   tts?: TtsPort | null
   singing?: SingingPort | null
@@ -45,7 +48,29 @@ function targetFromCtx(ctx: ToolRunContext): SendTarget | null {
 
 const SendVoiceArgsSchema = z.object({
   text: z.string().min(1).max(300),
+  emotion: z.enum(EMOTION_KINDS).optional(),
+  tone: z.string().max(40).optional(),
 })
+
+function inferVoiceEmotion(store: SoulStore, body: BodyEngine | undefined, now: Date): { emotion: AffectKind; speechRateDelta: number } {
+  const state = body?.state(now)
+  const sleepy = state ? (state.energy < 0.3 || state.sleepDebt > 0.65) : false
+  // 优先看最近 30 分钟内的真实情绪来由
+  const recent = store.recentEmotionCauses(1)[0]
+  if (recent && recent.affectKind !== 'neutral') {
+    const at = Date.parse(recent.createdAt.replace(' ', 'T'))
+    if (Number.isFinite(at) && now.getTime() - at <= 30 * 60_000) {
+      return { emotion: recent.affectKind, speechRateDelta: sleepy ? -8 : 0 }
+    }
+  }
+  if (sleepy) return { emotion: 'boredom', speechRateDelta: 0 }
+  if (state) {
+    if (state.pad.p < -0.25 && state.pad.a > 0.15) return { emotion: 'annoyed', speechRateDelta: 0 }
+    if (state.pad.p < -0.25) return { emotion: 'sadness', speechRateDelta: 0 }
+    if (state.pad.p > 0.4) return { emotion: 'praised', speechRateDelta: 0 }
+  }
+  return { emotion: 'neutral', speechRateDelta: 0 }
+}
 
 const SendStickerArgsSchema = z.object({
   emotion: z.enum(EMOTION_KINDS),
@@ -76,11 +101,13 @@ export function registerExpressionTools(registry: InMemoryToolRegistry, deps: Ex
       layer: 'express',
       spec: {
         name: 'send_voice',
-        description: '把你想说的一段简短的话合成语音条发给对方（适合温柔轻声、问候或哄人时用，别每句都发）。',
+        description: '把你想说的一段简短的话合成语音条发给对方（会随你的情绪自然改变语速和语调，别每句都发）。',
         parameters: {
           type: 'object',
           properties: {
             text: { type: 'string', description: '要念出来的纯口语文本（不要带括号动作或颜文字，≤200字）' },
+            emotion: { type: 'string', enum: [...EMOTION_KINDS], description: '可选：说这句话时的真实情绪（如 conflict/annoyed/hurt/praised/curiosity/neutral）' },
+            tone: { type: 'string', description: '可选：简短语气提示（如「语气冷淡地说」「带着笑意轻快地说」，≤24字）' },
           },
           required: ['text'],
         },
@@ -101,8 +128,17 @@ export function registerExpressionTools(registry: InMemoryToolRegistry, deps: Ex
         const clean = parsed.data.text.replace(/[（(][^）)]{0,24}[）)]/g, '').trim()
         if (!clean) return { output: '去掉括号动作后文本为空，请改用打字。', isError: true }
 
+        const inferred = inferVoiceEmotion(deps.store, deps.body, ctx.now)
+        const emotion = parsed.data.emotion ?? inferred.emotion
+
         try {
-          const audio = await tts.synth({ text: clean, signal: ctx.signal })
+          const audio = await tts.synth({
+            text: clean,
+            emotion,
+            tone: parsed.data.tone,
+            speechRateDelta: parsed.data.emotion ? 0 : inferred.speechRateDelta,
+            signal: ctx.signal,
+          })
           const b64 = Buffer.from(audio.bytes).toString('base64')
           await transport.send(target, { type: 'record', url: `base64://${b64}` })
           lastVoiceAt.set(ctx.threadKey, nowMs)

@@ -214,6 +214,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
     registerExpressionTools(tools, {
       store,
       relations: soul.relations,
+      body: soul.body,
       getTransport: () => transport,
       tts,
       singing,

@@ -11,6 +11,8 @@ import type { AdminContext } from '../context.ts'
 
 const TtsPreviewSchema = z.object({
   text: z.string().min(1).max(200),
+  emotion: z.enum(EMOTION_KINDS).optional(),
+  tone: z.string().max(40).optional(),
 })
 
 const ALLOWED_IMAGE_EXT = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
@@ -147,7 +149,11 @@ export function registerWorksRoutes(app: Hono, ctx: AdminContext): void {
     if (!bot.tts) return c.json({ error: '当前未配置语音合成（TTS）' }, 400)
     const body = TtsPreviewSchema.safeParse(await c.req.json().catch(() => null))
     if (!body.success) return c.json({ error: '请输入 1~200 字试听文本' }, 400)
-    const audio = await bot.tts.synth({ text: body.data.text })
+    const audio = await bot.tts.synth({
+      text: body.data.text,
+      emotion: body.data.emotion,
+      tone: body.data.tone,
+    })
     return new Response(new Uint8Array(audio.bytes), {
       status: 200,
       headers: { 'Content-Type': audio.mimeType },

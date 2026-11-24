@@ -277,12 +277,16 @@ export const api = {
     request<{ ok: boolean; sticker: StickerItem }>(`/api/bots/${encodeURIComponent(id)}/stickers`, { method: 'POST', body: form }),
   deleteSticker: (id: string, key: string) =>
     request<{ ok: boolean }>(`/api/bots/${encodeURIComponent(id)}/stickers/${encodeURIComponent(key)}`, { method: 'DELETE' }),
-  ttsPreviewBlob: async (id: string, text: string): Promise<Blob> => {
+  ttsPreviewBlob: async (id: string, text: string, opts?: { emotion?: string; tone?: string }): Promise<Blob> => {
     const res = await fetch(`/api/bots/${encodeURIComponent(id)}/tts/preview`, {
       method: 'POST',
       credentials: 'include',
       headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({
+        text,
+        ...(opts?.emotion ? { emotion: opts.emotion } : {}),
+        ...(opts?.tone?.trim() ? { tone: opts.tone.trim() } : {}),
+      }),
     })
     if (!res.ok) {
       const e = await res.json().catch(() => ({ error: `HTTP ${res.status}` })) as { error?: string }

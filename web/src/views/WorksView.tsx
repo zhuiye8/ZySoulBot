@@ -4,7 +4,21 @@ import { Music2, Play, Pause, Image as ImageIcon, Upload, Trash2, Volume2, Spark
 import { api } from '../lib/api.ts'
 import type { StickerItem, WorkItem } from '../lib/api.ts'
 
-const EMOTIONS = ['all', 'praised', 'affection', 'humor', 'curiosity', 'annoyed', 'hurt', 'sadness', 'uneasy', 'boredom', 'rejected', 'conflict', 'neutral'] as const
+const EMOTIONS = ['all', 'praised', 'affection', 'humor', 'curiosity', 'annoyed', 'hurt', 'sadness', 'uneasy', 'guilty', 'boredom', 'rejected', 'conflict', 'neutral'] as const
+
+const TTS_MOOD_PRESETS: Array<{ id: string; label: string }> = [
+  { id: 'neutral', label: '平静（基线）' },
+  { id: 'praised', label: '开心明朗' },
+  { id: 'affection', label: '温柔亲近' },
+  { id: 'curiosity', label: '好奇活泼' },
+  { id: 'humor', label: '俏皮逗趣' },
+  { id: 'hurt', label: '委屈低落' },
+  { id: 'sadness', label: '难过叹息' },
+  { id: 'guilty', label: '愧疚轻声' },
+  { id: 'annoyed', label: '烦躁不耐' },
+  { id: 'conflict', label: '冷淡生气' },
+  { id: 'boredom', label: '深夜犯困' },
+]
 
 export type WorksTab = 'songs' | 'stickers' | 'tts'
 
@@ -31,6 +45,8 @@ export function WorksView({
   const [uploading, setUploading] = useState(false)
 
   const [ttsText, setTtsText] = useState('你好呀，今天过得怎么样？')
+  const [ttsEmotion, setTtsEmotion] = useState<string>('neutral')
+  const [ttsTone, setTtsTone] = useState('')
   const [ttsLoading, setTtsLoading] = useState(false)
 
   useEffect(() => {
@@ -105,7 +121,7 @@ export function WorksView({
     if (!ttsText.trim()) return
     setTtsLoading(true)
     try {
-      const blob = await api.ttsPreviewBlob(botId, ttsText)
+      const blob = await api.ttsPreviewBlob(botId, ttsText, { emotion: ttsEmotion, tone: ttsTone })
       const url = URL.createObjectURL(blob)
       const audio = new Audio(url)
       audio.onended = () => URL.revokeObjectURL(url)
@@ -236,16 +252,38 @@ export function WorksView({
       </section>
       )}
 
-      {/* 2) 语音试听（TTS） */}
+      {/* 2) 语音试听（TTS，支持不同情绪动态语调对比） */}
       {tab === 'tts' && (
-      <section className="acg-card p-5 space-y-3">
+      <section className="acg-card p-5 space-y-4">
         <div className="flex items-center justify-between">
           <h3 className="text-[15px] font-semibold flex items-center gap-2">
             <Volume2 className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-            语音表达试听（TTS）
+            语音表达试听（情绪动态控调）
           </h3>
           <span className="acg-pill text-[11px]">{hasTts ? 'TTS 已就绪' : '未配置 TTS'}</span>
         </div>
+
+        <div className="space-y-1.5">
+          <div className="text-xs" style={{ color: 'var(--text-2)' }}>切换不同情绪对比语速与语调：</div>
+          <div className="flex flex-wrap gap-1.5">
+            {TTS_MOOD_PRESETS.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                onClick={() => setTtsEmotion(m.id)}
+                className="acg-pill cursor-pointer text-xs"
+                style={{
+                  backgroundColor: ttsEmotion === m.id ? 'var(--accent-soft)' : 'var(--surface-2)',
+                  color: ttsEmotion === m.id ? 'var(--accent)' : 'var(--text-2)',
+                  borderColor: ttsEmotion === m.id ? 'var(--accent)' : 'var(--border)',
+                }}
+              >
+                {m.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
         <div className="flex flex-col sm:flex-row gap-2.5">
           <input
             type="text"
@@ -253,6 +291,13 @@ export function WorksView({
             onChange={(e) => setTtsText(e.target.value)}
             placeholder="输入一句想让她念出来的话..."
             className="acg-input flex-1 font-voice"
+          />
+          <input
+            type="text"
+            value={ttsTone}
+            onChange={(e) => setTtsTone(e.target.value)}
+            placeholder="可选自定义语气（留空按所选情绪）"
+            className="acg-input sm:w-60 text-xs"
           />
           <button
             type="button"

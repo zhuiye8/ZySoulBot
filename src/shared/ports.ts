@@ -120,9 +120,20 @@ export interface ToolRegistry {
 }
 
 // ── 多模态感知与表达端口（TTS / ASR / 唱歌 / 平台传话）──────────────────
+export interface TtsSynthRequest {
+  text: string
+  /** 当下情绪（火山豆包 ICL 2.0 等动态调整语速与 context_texts 语气，neutral/缺省回落至基线） */
+  emotion?: AffectKind
+  /** 可选自定义语气指令，优先级高于默认情绪映射 */
+  tone?: string
+  /** 可选额外语速偏移（如深夜犯困 -10），最终会被钳位在安全区间 */
+  speechRateDelta?: number
+  signal?: AbortSignal
+}
+
 export interface TtsPort {
   id: string
-  synth(req: { text: string; signal?: AbortSignal }): Promise<{ bytes: Uint8Array; mimeType: string }>
+  synth(req: TtsSynthRequest): Promise<{ bytes: Uint8Array; mimeType: string }>
 }
 
 export interface AsrPort {
