@@ -1,0 +1,388 @@
+@import "tailwindcss";
+
+/* ── 4 套高审美轻二次元主题（严格对齐 docs/DESIGN.md 6 层语义令牌）──────────── */
+:root,
+[data-theme="mint"] {
+  --bg: #F2FBF6;
+  --surface: #FFFFFF;
+  --surface-2: #EAF6EE;
+  --border: #D1E9D8;
+  --text: #1A3626;
+  --text-2: #527360;
+  --accent: #22A073;
+  --accent-soft: #D8F3E5;
+  --accent-fg: #FFFFFF;
+  --grad-a: #95E2BF;
+  --grad-b: #DCF6C2;
+  --orb-1: rgba(94, 220, 168, 0.34);
+  --orb-2: rgba(182, 240, 168, 0.38);
+  --orb-3: rgba(114, 214, 210, 0.26);
+  --grid-dot: rgba(34, 160, 115, 0.14);
+  --shadow-card: 0 4px 20px rgba(26, 54, 38, 0.06);
+  --shadow-float: 0 18px 48px rgba(26, 54, 38, 0.11);
+}
+
+[data-theme="sky"] {
+  --bg: #F2F8FF;
+  --surface: #FFFFFF;
+  --surface-2: #EAF3FE;
+  --border: #D2E4F7;
+  --text: #19344E;
+  --text-2: #55748F;
+  --accent: #3288DF;
+  --accent-soft: #DDECFD;
+  --accent-fg: #FFFFFF;
+  --grad-a: #9CCEF7;
+  --grad-b: #C4EFFA;
+  --orb-1: rgba(110, 186, 250, 0.34);
+  --orb-2: rgba(154, 232, 248, 0.38);
+  --orb-3: rgba(156, 174, 248, 0.22);
+  --grid-dot: rgba(50, 136, 223, 0.14);
+  --shadow-card: 0 4px 20px rgba(25, 52, 78, 0.06);
+  --shadow-float: 0 18px 48px rgba(25, 52, 78, 0.11);
+}
+
+[data-theme="sakura"] {
+  --bg: #FFF6F9;
+  --surface: #FFFFFF;
+  --surface-2: #FFEEF3;
+  --border: #F4D8E2;
+  --text: #452632;
+  --text-2: #86616E;
+  --accent: #E25587;
+  --accent-soft: #FCDFE9;
+  --accent-fg: #FFFFFF;
+  --grad-a: #F9AECC;
+  --grad-b: #FFD4B8;
+  --orb-1: rgba(249, 152, 190, 0.34);
+  --orb-2: rgba(255, 198, 166, 0.38);
+  --orb-3: rgba(235, 164, 222, 0.25);
+  --grid-dot: rgba(226, 85, 135, 0.14);
+  --shadow-card: 0 4px 20px rgba(69, 38, 50, 0.06);
+  --shadow-float: 0 18px 48px rgba(69, 38, 50, 0.11);
+}
+
+[data-theme="night"] {
+  --bg: #0F141B;
+  --surface: #171E28;
+  --surface-2: #1F2836;
+  --border: #2B3749;
+  --text: #ECF2F9;
+  --text-2: #90A3BA;
+  --accent: #54CA9E;
+  --accent-soft: rgba(84, 202, 158, 0.16);
+  --accent-fg: #0C1A14;
+  --grad-a: #1A3531;
+  --grad-b: #1F2B3D;
+  --orb-1: rgba(84, 202, 158, 0.22);
+  --orb-2: rgba(74, 143, 224, 0.20);
+  --orb-3: rgba(140, 120, 230, 0.14);
+  --grid-dot: rgba(144, 163, 186, 0.15);
+  --shadow-card: 0 6px 24px rgba(0, 0, 0, 0.32);
+  --shadow-float: 0 22px 54px rgba(0, 0, 0, 0.48);
+}
+
+:root {
+  --ok: #2DA876;
+  --warn: #E59A32;
+  --danger: #DF5365;
+  --info: #4A8FE0;
+}
+
+/* 必须放进 @layer base，绝不盖掉 Tailwind v4 的 @layer utilities！ */
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    margin: 0;
+    padding: 0;
+    background-color: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', 'PingFang SC', 'Noto Sans SC', 'Microsoft YaHei', sans-serif;
+    font-size: 14px;
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+    transition: background-color 220ms ease, color 220ms ease;
+  }
+}
+
+/* 必须放进 @layer components，使 pl-9 / p-2 / py-1.5 等原子工具类正常生效 */
+@layer components {
+  .font-voice {
+    font-family: 'LXGW WenKai Screen', 'LXGW WenKai', 'Noto Serif SC', Georgia, serif;
+  }
+
+  .font-mono-num {
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .tabular-nums {
+    font-variant-numeric: tabular-nums;
+  }
+
+  .acg-card {
+    background-color: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    box-shadow: var(--shadow-card);
+    transition: border-color 180ms ease, background-color 180ms ease, transform 180ms ease;
+  }
+
+  .acg-glass-card {
+    background: color-mix(in srgb, var(--surface) 84%, transparent);
+    backdrop-filter: blur(20px) saturate(140%);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    border: 1px solid color-mix(in srgb, var(--border) 88%, var(--surface));
+    border-radius: 22px;
+    box-shadow: var(--shadow-float);
+  }
+
+  .acg-hero {
+    position: relative;
+    overflow: hidden;
+    border-radius: 18px;
+    border: 1px solid var(--border);
+    background: linear-gradient(135deg, var(--grad-a) 0%, var(--grad-b) 100%);
+    box-shadow: var(--shadow-card);
+  }
+
+  .acg-hero-inner {
+    background: color-mix(in srgb, var(--surface) 78%, transparent);
+    backdrop-filter: blur(10px);
+  }
+
+  .acg-pill {
+    border-radius: 9999px;
+    border: 1px solid var(--border);
+    background-color: var(--surface-2);
+    color: var(--text-2);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 3px 10px;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+  }
+
+  .acg-btn {
+    border-radius: 11px;
+    font-weight: 500;
+    font-size: 13px;
+    padding: 8px 14px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    cursor: pointer;
+    transition: transform 140ms ease, opacity 140ms ease, background-color 160ms ease, border-color 160ms ease, box-shadow 180ms ease;
+  }
+
+  .acg-btn:active {
+    transform: scale(0.98);
+  }
+
+  .acg-btn:focus-visible,
+  .acg-input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+
+  .acg-btn-primary {
+    background-color: var(--accent);
+    color: var(--accent-fg);
+    border: 1px solid transparent;
+    box-shadow: 0 4px 14px color-mix(in srgb, var(--accent) 28%, transparent);
+  }
+
+  .acg-btn-primary:hover {
+    opacity: 0.94;
+    box-shadow: 0 6px 20px color-mix(in srgb, var(--accent) 36%, transparent);
+  }
+
+  .acg-btn-soft {
+    background-color: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+  }
+
+  .acg-btn-soft:hover {
+    border-color: var(--accent);
+  }
+
+  .acg-input {
+    background-color: var(--surface-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 11px;
+    padding: 9px 12px;
+    font-size: 14px;
+    transition: border-color 150ms ease, background-color 150ms ease, box-shadow 150ms ease;
+  }
+
+  /* 带前后图标的弹性输入壳：图标与文字物理分列，永不重叠 */
+  .acg-input-box {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background-color: var(--surface-2);
+    border: 1.5px solid var(--border);
+    border-radius: 12px;
+    padding: 0 13px;
+    transition: border-color 160ms ease, box-shadow 160ms ease, background-color 160ms ease;
+  }
+
+  .acg-input-box:focus-within {
+    border-color: var(--accent);
+    background-color: var(--surface);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
+  }
+
+  .acg-input-bare {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: 0;
+    outline: none;
+    color: var(--text);
+    padding: 11px 0;
+    font-size: 14px;
+  }
+
+  .acg-input-bare::placeholder {
+    color: color-mix(in srgb, var(--text-2) 72%, transparent);
+  }
+
+  .acg-dot-grid {
+    background-image: radial-gradient(var(--grid-dot) 1.25px, transparent 1.25px);
+    background-size: 26px 26px;
+  }
+}
+
+/* ── 登录页轻二次元光晕、星轨旋转与按钮扫光动效 ──────────────────────────── */
+@keyframes orbDriftA {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(38px, -26px) scale(1.08); }
+}
+
+@keyframes orbDriftB {
+  0%, 100% { transform: translate(0, 0) scale(1); }
+  50% { transform: translate(-34px, 30px) scale(1.1); }
+}
+
+@keyframes slowSpin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+@keyframes slowSpinRev {
+  from { transform: rotate(360deg); }
+  to { transform: rotate(0deg); }
+}
+
+@keyframes btnShimmer {
+  0% { transform: translateX(-140%) skewX(-20deg); }
+  100% { transform: translateX(260%) skewX(-20deg); }
+}
+
+.acg-orb-a {
+  animation: orbDriftA 14s ease-in-out infinite;
+}
+
+.acg-orb-b {
+  animation: orbDriftB 17s ease-in-out infinite;
+}
+
+.acg-ring-cw {
+  animation: slowSpin 38s linear infinite;
+}
+
+.acg-ring-ccw {
+  animation: slowSpinRev 52s linear infinite;
+}
+
+.acg-shimmer-btn {
+  position: relative;
+  overflow: hidden;
+}
+
+.acg-shimmer-btn::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 44%;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.32), transparent);
+  animation: btnShimmer 3.2s ease-in-out infinite;
+  pointer-events: none;
+}
+
+/* ── 可一键关闭的轻柔氛围浮尘 ────────────────────────────────────────────── */
+@keyframes ambientRise {
+  0% {
+    transform: translateY(28px) translateX(0px) scale(0.75) rotate(0deg);
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.9;
+  }
+  55% {
+    transform: translateY(-28px) translateX(var(--drift, 16px)) scale(1.08) rotate(24deg);
+    opacity: 0.85;
+  }
+  85% {
+    opacity: 0.7;
+  }
+  100% {
+    transform: translateY(-84px) translateX(0px) scale(0.8) rotate(45deg);
+    opacity: 0;
+  }
+}
+
+@keyframes ambientFall {
+  0% {
+    transform: translateY(-48px) translateX(0px) scale(0.85) rotate(0deg);
+    opacity: 0;
+  }
+  18% {
+    opacity: 0.92;
+  }
+  55% {
+    transform: translateY(32px) translateX(var(--drift, 20px)) scale(1.05) rotate(110deg);
+    opacity: 0.85;
+  }
+  88% {
+    opacity: 0.65;
+  }
+  100% {
+    transform: translateY(96px) translateX(calc(var(--drift, 20px) * -0.5)) scale(0.85) rotate(210deg);
+    opacity: 0;
+  }
+}
+
+.acg-ambient-rise {
+  position: absolute;
+  will-change: transform, opacity;
+  animation: ambientRise var(--dur, 12s) ease-in-out var(--delay, 0s) infinite;
+}
+
+.acg-ambient-fall {
+  position: absolute;
+  will-change: transform, opacity;
+  animation: ambientFall var(--dur, 12s) ease-in-out var(--delay, 0s) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .acg-ambient-rise,
+  .acg-ambient-fall,
+  .acg-orb-a,
+  .acg-orb-b,
+  .acg-ring-cw,
+  .acg-ring-ccw,
+  .acg-shimmer-btn::after {
+    animation: none;
+  }
+}

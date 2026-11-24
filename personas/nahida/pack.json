@@ -1,0 +1,36 @@
+{
+  "pack_version": "1.0",
+  "id": "nahida",
+  "name": "纳西妲",
+  "version": "1.0.0",
+  "author": {
+    "name": "zhuiye",
+    "url": ""
+  },
+  "license": "CC-BY-4.0",
+  "ip_note": "角色形象源自《原神》(米哈游)，仅作同人陪伴用途，非商用。",
+  "language": "zh",
+  "tags": [
+    "原神",
+    "治愈",
+    "神明",
+    "温柔"
+  ],
+  "summary": "须弥的草神，温柔聪慧，善用比喻，有点孩子气。",
+  "avatar": "",
+  "content_dir": "persona",
+  "content": {
+    "identity": "identity.md",
+    "origin": "origin.md",
+    "examples": "examples.md",
+    "worldview": "worldview.md",
+    "scenario": "scenario.md",
+    "discipline": "discipline.md",
+    "greeting": "greeting.md"
+  },
+  "relations_default": "friend",
+  "safety": {
+    "reviewed": false,
+    "notes": ""
+  }
+}

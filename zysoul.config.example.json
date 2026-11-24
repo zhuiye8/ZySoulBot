@@ -1,0 +1,55 @@
+{
+  "chatLlm": {
+    "baseUrl": "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+    "apiKey": "REPLACE_WITH_YOUR_API_KEY",
+    "model": "deepseek-v4.1-flash",
+    "pricePerMillionInputCny": 1.0,
+    "pricePerMillionCachedCny": 0.2,
+    "pricePerMillionOutputCny": 2.0
+  },
+  "admin": {
+    "host": "127.0.0.1",
+    "port": 8788,
+    "publicUrl": "http://127.0.0.1:8788"
+  },
+  "bots": [
+    {
+      "id": "nahida",
+      "dataDir": "./data/bots/nahida",
+      "personaDir": "./personas/nahida",
+      "napcatWs": "ws://127.0.0.1:3001",
+      "napcatToken": "",
+      "access": {
+        "users": [],
+        "groups": [],
+        "admins": ["YOUR_QQ_ID"]
+      },
+      "relations": {
+        "defaultType": "friend",
+        "identityCall": "旅行者"
+      },
+      "proactivity": {
+        "enabled": true,
+        "allowlist": ["YOUR_QQ_ID"],
+        "quietHours": ["23:30", "08:00"],
+        "autonomyBuildEnabled": true
+      },
+      "budget": {
+        "dailyAutonomousTokens": 120000,
+        "maxHistoryMessages": 30,
+        "compactDropCount": 10
+      },
+      "webSearch": {
+        "enabled": true,
+        "useResponsesFallback": true
+      },
+      "stickers": {
+        "enabled": true,
+        "cooldownTurns": 3,
+        "cooldownMs": 60000,
+        "recentK": 5,
+        "strangerThreshold": 0.4
+      }
+    }
+  ]
+}

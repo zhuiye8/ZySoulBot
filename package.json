@@ -1,0 +1,35 @@
+{
+  "name": "zysoulbot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Soul-first QQ companion hub with a soul-native lightweight agent loop and SQLite single-source memory.",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node src/start.ts",
+    "test": "node --test",
+    "lint": "eslint src test scripts eslint.config.js .dependency-cruiser.mjs",
+    "typecheck": "tsc --noEmit",
+    "depcruise:check": "dependency-cruiser src",
+    "dev:web": "pnpm --dir web dev",
+    "build:web": "pnpm --dir web build",
+    "check": "pnpm run lint && pnpm run typecheck && pnpm run depcruise:check && pnpm run test"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.14.4",
+    "hono": "^4.8.0",
+    "ws": "^8.18.2",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@stylistic/eslint-plugin": "^4.4.1",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "dependency-cruiser": "^18.7.2",
+    "eslint": "^10.14.0",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.2"
+  }
+}

@@ -1,0 +1,98 @@
+[
+  {
+    "id": "morning_walk",
+    "label": "清早收拾好出门，沿着须弥城的树桥走走",
+    "place": "净善宫→须弥城",
+    "times": ["morning"],
+    "durationMin": [20, 40],
+    "yields": "sight",
+    "effects": { "energy": -0.05, "pad": { "p": 0.08, "a": 0.05 }, "drives": { "curiosity": -0.1 } },
+    "source": "官方语音「早上好…」：这世上有太多的东西都是过时不候的呢"
+  },
+  {
+    "id": "listen_dreams",
+    "label": "去「品梦一刻」坐着，安静听人讲他们的梦",
+    "place": "须弥城·品梦一刻",
+    "times": ["noon", "afternoon"],
+    "durationMin": [30, 60],
+    "yields": "sight",
+    "effects": { "energy": -0.06, "pad": { "p": 0.1, "a": -0.02 }, "drives": { "companionship": -0.08, "curiosity": -0.12 } },
+    "source": "3.2 传说任务《坠落之梦》"
+  },
+  {
+    "id": "woodcraft",
+    "label": "拿木料和小刻刀做一件立体拼合锁",
+    "place": "净善宫",
+    "times": ["evening", "night"],
+    "durationMin": [30, 80],
+    "yields": "none",
+    "effects": { "energy": -0.08, "pad": { "p": 0.09, "d": 0.06 }, "drives": { "creative": -0.18 } },
+    "source": "角色故事《玩具箱》"
+  },
+  {
+    "id": "watch_bazaar",
+    "label": "在市集边看人做事，看得出神",
+    "place": "须弥城·市集边",
+    "times": ["afternoon"],
+    "durationMin": [12, 25],
+    "yields": "sight",
+    "effects": { "energy": -0.03, "pad": { "p": 0.06, "a": 0.04 }, "drives": { "curiosity": -0.1 } }
+  },
+  {
+    "id": "inspect_flower",
+    "label": "蹲下来仔细看一株快要开的花",
+    "place": "街道边/林间",
+    "times": [],
+    "durationMin": [5, 12],
+    "yields": "sight",
+    "effects": { "energy": 0.04, "pad": { "p": 0.05, "a": -0.03 } }
+  },
+  {
+    "id": "check_greenery",
+    "label": "去看看自己设计的城里绿植，琢磨配色对不对",
+    "place": "须弥城·街道",
+    "times": ["morning", "noon"],
+    "durationMin": [15, 25],
+    "yields": "sight",
+    "effects": { "energy": -0.04, "pad": { "p": 0.04, "a": 0.03 }, "drives": { "creative": -0.08 } },
+    "source": "角色故事 4"
+  },
+  {
+    "id": "nap_sanctuary",
+    "label": "靠在净善宫的窗边听雨林的风，打个小盹",
+    "place": "净善宫·窗边",
+    "times": ["noon", "afternoon", "night"],
+    "durationMin": [25, 60],
+    "yields": "none",
+    "effects": { "energy": 0.25, "pad": { "p": 0.04, "a": -0.08 } }
+  },
+  {
+    "id": "child_dream",
+    "label": "去一个孩子的梦里陪他做游戏，直到安静下来",
+    "place": "梦境",
+    "times": ["night"],
+    "durationMin": [60, 150],
+    "yields": "sight",
+    "effects": { "energy": -0.18, "pad": { "p": 0.12, "a": -0.06 }, "drives": { "companionship": -0.1 } },
+    "source": "角色故事 3"
+  },
+  {
+    "id": "review_notes",
+    "label": "翻自己的小本子，把没想通的那件事再理一遍",
+    "place": "净善宫",
+    "times": [],
+    "durationMin": [20, 50],
+    "yields": "sight",
+    "effects": { "energy": -0.07, "pad": { "a": 0.04, "d": 0.05 }, "drives": { "curiosity": -0.12 } }
+  },
+  {
+    "id": "mountain_stroll",
+    "label": "出城往山上走走，顺便散散心",
+    "place": "城外·山坡",
+    "times": ["morning", "afternoon"],
+    "durationMin": [45, 100],
+    "yields": "sight",
+    "effects": { "energy": -0.1, "pad": { "p": 0.11, "a": 0.02 }, "drives": { "curiosity": -0.14 } },
+    "source": "3.6 剧情"
+  }
+]
