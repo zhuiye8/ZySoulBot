@@ -111,7 +111,8 @@ export const BotConfigSchema = z.object({
     strangerThreshold: z.number().min(0).max(1).default(0.4),
   }).optional(),
   asr: z.object({
-    baseUrl: z.string().url(),
+    provider: z.enum(['openai', 'minimax']).default('openai'),
+    baseUrl: z.string().url().optional(),
     apiKey: z.string().min(1),
     model: z.string().default('whisper-1'),
     language: z.string().optional(),

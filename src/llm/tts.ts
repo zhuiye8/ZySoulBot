@@ -1,6 +1,7 @@
 // 统一语音合成适配器（实现 TtsPort）：支持火山豆包 ICL 2.0（SSE 流）、OpenAI 兼容 /audio/speech 与自托管 HTTP。
 import { randomUUID } from 'node:crypto'
 import { classifyHttp, SoulError } from '../shared/errors.ts'
+import { resolveEnvValue } from '../shared/time.ts'
 import type { BotConfig } from '../shared/config.ts'
 import type { TtsPort } from '../shared/ports.ts'
 
@@ -26,9 +27,11 @@ function concatBytes(parts: Uint8Array[]): Uint8Array {
 
 function createVolcTts(cfg: Extract<TtsConfig, { provider: 'volc' }>, fetchImpl: typeof fetch): TtsPort {
   const base = cfg.baseUrl.replace(/\/+$/, '')
+  const apiKey = resolveEnvValue(cfg.apiKey)
   return {
     id: 'volc',
     async synth({ text, signal }) {
+      if (!apiKey) throw new SoulError('auth', 'volc tts api key missing (check ENV variable)')
       const body = text.trim().slice(0, MAX_TTS_TEXT)
       if (!body) throw new SoulError('protocol', 'tts text empty')
       const timeout = AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS)
@@ -39,7 +42,7 @@ function createVolcTts(cfg: Extract<TtsConfig, { provider: 'volc' }>, fetchImpl:
         res = await fetchImpl(`${base}/api/v3/tts/unidirectional/sse`, {
           method: 'POST',
           headers: {
-            'X-Api-Key': cfg.apiKey,
+            'X-Api-Key': apiKey,
             'X-Api-Resource-Id': cfg.resourceId,
             'X-Api-Request-Id': randomUUID(),
             'Content-Type': 'application/json',
@@ -95,9 +98,11 @@ function createVolcTts(cfg: Extract<TtsConfig, { provider: 'volc' }>, fetchImpl:
 
 function createOpenAiTts(cfg: Extract<TtsConfig, { provider: 'openai' }>, fetchImpl: typeof fetch): TtsPort {
   const base = cfg.baseUrl.replace(/\/+$/, '')
+  const apiKey = resolveEnvValue(cfg.apiKey)
   return {
     id: 'openai-tts',
     async synth({ text, signal }) {
+      if (!apiKey) throw new SoulError('auth', 'openai tts api key missing (check ENV variable)')
       const body = text.trim().slice(0, MAX_TTS_TEXT)
       if (!body) throw new SoulError('protocol', 'tts text empty')
       const timeout = AbortSignal.timeout(cfg.timeoutMs ?? DEFAULT_TIMEOUT_MS)
@@ -108,7 +113,7 @@ function createOpenAiTts(cfg: Extract<TtsConfig, { provider: 'openai' }>, fetchI
         res = await fetchImpl(`${base}/audio/speech`, {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${cfg.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify({

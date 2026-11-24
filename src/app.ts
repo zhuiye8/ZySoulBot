@@ -14,7 +14,7 @@ import type {
   TtsPort,
 } from './shared/ports.ts'
 import { SerialQueue } from './shared/serial-queue.ts'
-import { nowLocal, systemClock } from './shared/time.ts'
+import { nowLocal, resolveEnvValue, systemClock } from './shared/time.ts'
 import type { Clock } from './shared/time.ts'
 import { SqliteSoulStore } from './storage/sqlite-store.ts'
 import { DiaryBook } from './storage/diary.ts'
@@ -185,10 +185,13 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
       priceTable,
     })
 
-    const tts: TtsPort | null = deps.ttsOverride ?? (botCfg.tts
+    const ttsReady = botCfg.tts
+      ? (botCfg.tts.provider === 'local' || Boolean(resolveEnvValue(botCfg.tts.apiKey)))
+      : false
+    const tts: TtsPort | null = deps.ttsOverride ?? (botCfg.tts && ttsReady
       ? createTtsAdapter(botCfg.tts, { fetchImpl: deps.fetchImpl })
       : null)
-    const singing: SingingPort | null = deps.singingOverride ?? (botCfg.mureka
+    const singing: SingingPort | null = deps.singingOverride ?? (botCfg.mureka && resolveEnvValue(botCfg.mureka.apiKey)
       ? createMurekaAdapter({ ...botCfg.mureka, fetchImpl: deps.fetchImpl })
       : null)
     const stickers: StickerLibrary | null = botCfg.stickers?.enabled === false
@@ -201,7 +204,7 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
         random: deps.random,
       })
 
-    const asr: AsrPort | null = botCfg.asr
+    const asr: AsrPort | null = botCfg.asr && resolveEnvValue(botCfg.asr.apiKey)
       ? createAsrAdapter({ ...botCfg.asr, fetchImpl: deps.fetchImpl })
       : null
 

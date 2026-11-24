@@ -4,6 +4,7 @@
 // - POST /v1/song/vocal-clone 独立工具函数：上传 15-30s 干声获取 vocal_id
 import { z } from 'zod'
 import { classifyHttp, parseRetryAfter, SoulError } from '../shared/errors.ts'
+import { resolveEnvValue } from '../shared/time.ts'
 import type { SingingCreateReq, SingingPollResult, SingingPort } from '../shared/ports.ts'
 
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -53,6 +54,7 @@ function mapMurekaStatus(raw: string): SingingPollResult['status'] {
 
 export function createMurekaAdapter(opts: MurekaOptions): SingingPort {
   const base = (opts.baseUrl ?? 'https://api.mureka.cn').replace(/\/+$/, '')
+  const apiKey = resolveEnvValue(opts.apiKey)
   const defaultModel = opts.model ?? 'auto'
   const fetchImpl = opts.fetchImpl ?? globalThis.fetch
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS
@@ -79,7 +81,7 @@ export function createMurekaAdapter(opts: MurekaOptions): SingingPort {
         res = await fetchImpl(`${base}/v1/song/generate`, {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${opts.apiKey}`,
+            Authorization: `Bearer ${apiKey}`,
             'Content-Type': 'application/json',
           },
           body: JSON.stringify(payload),
@@ -119,7 +121,7 @@ export function createMurekaAdapter(opts: MurekaOptions): SingingPort {
       try {
         res = await fetchImpl(`${base}/v1/song/query/${encodeURIComponent(taskId)}`, {
           method: 'GET',
-          headers: { Authorization: `Bearer ${opts.apiKey}` },
+          headers: { Authorization: `Bearer ${apiKey}` },
           signal,
         })
       } catch (e) {

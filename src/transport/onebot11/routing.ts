@@ -40,9 +40,11 @@ export function extractImages(message: OneBotSegment[] | string | undefined): st
   if (!Array.isArray(message)) return []
   const out: string[] = []
   for (const s of message) {
-    if (s?.type !== 'image') continue
-    const u = String(s.data?.url ?? '')
-    if (/^https?:\/\//i.test(u)) out.push(u)
+    if (s?.type !== 'image' && s?.type !== 'mface') continue
+    const rawUrl = String(s.data?.url ?? '')
+    const rawFile = String(s.data?.file ?? '')
+    const candidate = /^https?:\/\//i.test(rawUrl) ? rawUrl : (/^https?:\/\//i.test(rawFile) ? rawFile : '')
+    if (candidate) out.push(candidate)
   }
   return out
 }
@@ -78,8 +80,23 @@ export function extractRich(message: OneBotSegment[] | string | undefined, selfI
         break
       }
       case 'record': {
-        out.attachments.push({ kind: 'record', url: str('url') || undefined })
+        const rawUrl = str('url')
+        const rawFile = str('file')
+        const url = /^https?:\/\//i.test(rawUrl) ? rawUrl : (/^https?:\/\//i.test(rawFile) ? rawFile : undefined)
+        out.attachments.push({ kind: 'record', url })
         notes.push('[语音]')
+        break
+      }
+      case 'image': {
+        const summary = str('summary').trim()
+        const subType = Number(d.sub_type ?? 0)
+        if (summary) notes.push(summary.startsWith('[') ? summary : `[图片:${summary}]`)
+        else if (subType === 1) notes.push('[表情包]')
+        break
+      }
+      case 'mface': {
+        const summary = str('summary').trim()
+        notes.push(summary ? `[表情包:${summary.replace(/^\[|\]$/g, '')}]` : '[商城表情包]')
         break
       }
       case 'video': {
@@ -118,13 +135,40 @@ export function extractRich(message: OneBotSegment[] | string | undefined, selfI
         notes.push(`[链接:${title} ${url}]`.trim())
         break
       }
+      case 'music': {
+        const title = str('title') || str('id') || '音乐'
+        const url = str('url') || str('audio') || undefined
+        out.attachments.push({ kind: 'music', title, url })
+        notes.push(`[音乐:${title}]`)
+        break
+      }
+      case 'location': {
+        const title = str('title') || str('content') || '位置'
+        notes.push(`[位置:${title}]`)
+        break
+      }
       case 'forward': {
         out.attachments.push({ kind: 'forward', title: str('id') })
         notes.push('[合并转发聊天记录]')
         break
       }
       case 'face': {
-        notes.push(`[QQ表情:${str('id')}]`)
+        const rawObj = d.raw as { faceText?: string } | undefined
+        const label = rawObj?.faceText?.trim() || str('id')
+        notes.push(`[QQ表情:${label}]`)
+        break
+      }
+      case 'dice': {
+        notes.push(`[掷骰子:${str('result') || '?'}]`)
+        break
+      }
+      case 'rps': {
+        notes.push(`[猜拳:${str('result') || '?'}]`)
+        break
+      }
+      case 'markdown': {
+        const md = str('content').trim()
+        if (md) notes.push(md.slice(0, 200))
         break
       }
       default: break

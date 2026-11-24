@@ -22,8 +22,8 @@ export function timeHHMM(d: Date = new Date()): string {
 }
 
 export function resolveEnvValue(value: string): string {
-  if (value.startsWith('ENV:')) return process.env[value.slice(4)] ?? ''
-  return value
+  if (/^env:/i.test(value)) return (process.env[value.slice(4)] ?? '').trim()
+  return value.trim()
 }
 
 export function formatTimeSpan(ms: number): string {

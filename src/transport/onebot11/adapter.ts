@@ -76,8 +76,30 @@ export function createOneBot11Transport(opts: OneBot11Options): TransportPort {
       return
     }
 
-    const ev = data as unknown as OneBotEvent
+    const ev = data as unknown as OneBotEvent & {
+      notice_type?: string
+      sub_type?: string
+      target_id?: number | string
+    }
     if (ev.self_id && !selfId) selfId = String(ev.self_id)
+
+    // 支持 QQ 戳一戳（私聊 / 群聊戳自己）
+    if (ev.post_type === 'notice' && ev.notice_type === 'notify' && ev.sub_type === 'poke') {
+      if (!ev.user_id || String(ev.user_id) === selfId) return
+      if (selfId && String(ev.target_id ?? '') !== selfId) return
+      const isGroupPoke = ev.group_id !== undefined && ev.group_id !== null
+      opts.onMessage({
+        botId: opts.botId,
+        threadKey: isGroupPoke ? `qq:group:${ev.group_id}` : `qq:private:${ev.user_id}`,
+        messageType: isGroupPoke ? 'group' : 'private',
+        userId: String(ev.user_id),
+        groupId: isGroupPoke ? String(ev.group_id) : null,
+        text: '（轻轻戳了戳你）',
+        atMe: isGroupPoke,
+      })
+      return
+    }
+
     if (ev.post_type !== 'message') return
     if (ev.user_id !== undefined && String(ev.user_id) === selfId) return
 
