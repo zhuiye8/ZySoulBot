@@ -40,6 +40,13 @@ function splitLong(unit: string, maxChars: number): string[] {
   return out
 }
 
+// QQ 气泡口语自然化：去掉每条普通对话气泡末尾的书面句号 `。`（保留 `？`/`！`/`…`/`~`、列表和长文不动），像真人随手打字。
+function softenBubbleTail(bubble: string): string {
+  const firstLine = bubble.split('\n')[0] ?? ''
+  if (isListLine(firstLine) || bubble.length > 160) return bubble
+  return bubble.replace(/。+$/u, '').trim()
+}
+
 export function splitReply(text: string, opts: SplitOptions = {}): string[] {
   const maxChars = opts.maxChars ?? 80
   const maxBubbles = opts.maxBubbles ?? 4
@@ -90,7 +97,7 @@ export function splitReply(text: string, opts: SplitOptions = {}): string[] {
   if (withTail.length > maxBubbles) {
     const head = withTail.slice(0, maxBubbles - 1)
     const tail = withTail.slice(maxBubbles - 1).join('\n\n')
-    return [...head, tail]
+    return [...head, tail].map(softenBubbleTail).filter(Boolean)
   }
-  return withTail
+  return withTail.map(softenBubbleTail).filter(Boolean)
 }

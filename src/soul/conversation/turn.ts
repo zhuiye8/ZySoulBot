@@ -103,23 +103,96 @@ export function stripInnerMonologue(raw: string): { reply: string; inner: string
   }
 }
 
-const UNIFIED_EXTRACT_SYSTEM = `你是角色自己的记忆与内心整理器，从刚结束的一轮对话里一次抽出以下字段，用她的第一人称视角，严格输出 JSON：
-0. pragmaticNote（必填，≤25字，必须最先思考）：先判断对方话语的字面意思与真实意图是否背离（例如“行行行都怪我”“好吧对不起行了吧”属于敷衍反讽，绝不是真诚道歉；如实写一句语用判断）。
-1. facts（最多 2 条，宁缺毋滥）：只记日后想起来有用的关于对方的事实/偏好/约定/称呼要求；不记她自己说过的话；若对方明确要求改称呼则 kind=address 并填 call。
-2. affect：这一轮让她产生的主要情绪（正面：praised/affection/curiosity/humor；负面：annoyed烦躁被敷衍/hurt委屈受伤/rejected被拒推开/conflict争执冒犯/sadness难过/uneasy尴尬戒备/guilty内疚自责；中性：boredom/neutral）与强度 0~1。请如实反映负面感受，不要替对方找借口。
-3. happened：一句话记下这一轮发生了什么具体事（≤40字；纯闲聊留空串）。
-4. relationFeel：这一轮之后她对这个人的感受变化：
-   - better+ / better++：明显被关心、理解、温暖或一起开心
-   - worse+：对方敷衍、冷淡、反讽、不耐烦、轻视、爽约或让人不舒服
-   - worse++：对方明显冒犯、辱骂、喝止（如闭嘴/滚/嫌烦）、伤害感情或严重失信
-   - repair：之前确有未解疙瘩，且对方这一轮**真诚**道歉、认真解释误会或温柔安抚（敷衍阴阳怪气严禁标 repair！）
-   - same / unclear：平常无波澜的普通对话
-5. tensionNote：仅当 relationFeel 为 worse+ 或 worse++ 时，用一句话客观记下带原话摘录的起因（≤40字，例：“他说『烦死了闭嘴』让我很不舒服”）；其余留空串。
-6. selfMistake：仅当对方指出她记错了事实、说错话伤到对方、或她自己违约搞砸时，客观记一句过意不去的事（≤40字）；没有留空串。
-7. desireHint：如果这轮对话勾起了她自己想查、想学、想画、想唱或想做的念头，用第一人称写一句；没有就留空串。
+const UNIFIED_EXTRACT_SYSTEM = `你是角色自己的记忆与内心整理器，从刚结束的一轮对话里一次抽出以下字段，用她的第一人称视角，直接输出紧凑合法 JSON（不要解释、不要长篇思考、不要 Markdown 代码块）。
 
-只输出 JSON，不要任何其他文字：
-{"pragmaticNote":"","facts":[],"affect":{"kind":"neutral","intensity":0.35},"happened":"","relationFeel":"same","tensionNote":"","selfMistake":"","signalKind":"chat","desireHint":""}`
+严格按以下 JSON 结构与精确字段名输出：
+{
+  "pragmaticNote": "≤25字语用判断，先判字面与真实意图是否背离（敷衍反讽绝不标 repair）",
+  "facts": [
+    {
+      "kind": "fact | preference | promise | milestone | address",
+      "text": "≤60字，关于对方的事实/偏好/约定/称呼（必填字段名为 text，不是 content）",
+      "tier": "fleeting | season | lasting | permanent",
+      "sensitivity": "open | personal | private | critical",
+      "disclosable": "volunteer | when-asked | secretive",
+      "call": "仅当对方明确要求改称呼时填新称呼，否则省略"
+    }
+  ],
+  "affect": { "kind": "praised|affection|curiosity|humor|annoyed|hurt|rejected|conflict|sadness|uneasy|guilty|boredom|neutral", "intensity": 0.4 },
+  "happened": "≤40字具体事件，纯闲聊留空串",
+  "relationFeel": "better+ | better++ | worse+ | worse++ | repair | same | unclear",
+  "tensionNote": "仅 worse+/worse++ 时记带原话摘录的起因，否则空串",
+  "selfMistake": "仅她自己说错话/记错事/违约时记一句，否则空串",
+  "signalKind": "chat",
+  "desireHint": "勾起想查/想学/想做的新念头，没有留空串"
+}
+
+要点：
+- facts 最多 2 条，宁缺毋滥；不记她自己说过的话；对方告知名字/称呼时务必写一条 kind="address" 且填 call（如 "call": "追夜"）。
+- 如实反映负面感受，不替对方找借口；敷衍阴阳怪气严禁标 repair。`
+
+const FACT_KINDS = new Set(['fact', 'preference', 'promise', 'milestone', 'address'])
+const TIERS = new Set(['fleeting', 'season', 'lasting', 'permanent'])
+const SENSITIVITIES = new Set(['open', 'personal', 'private', 'critical'])
+const DISCLOSABLES = new Set(['volunteer', 'when-asked', 'secretive'])
+const AFFECT_SET = new Set<string>(EMOTION_KINDS)
+const FEEL_SET = new Set(['better+', 'better++', 'worse+', 'worse++', 'repair', 'same', 'unclear'])
+
+// 字段级容错归一：防止模型偶发把 text 写成 content、把 kind 写成 plan/other 或轻微超长导致整轮抽取被 Zod 全部丢弃
+export function normalizeRawExtraction(raw: unknown): Record<string, unknown> {
+  const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {}
+  const str = (v: unknown, max: number): string => (typeof v === 'string' ? v.trim().slice(0, max) : '')
+
+  const rawFacts = Array.isArray(obj.facts) ? obj.facts : []
+  const facts: Array<Record<string, unknown>> = []
+  for (const item of rawFacts.slice(0, 3)) {
+    if (!item || typeof item !== 'object') continue
+    const f = item as Record<string, unknown>
+    const rawCall = str(f.call ?? f.callName ?? f.nickname ?? f.name, 16)
+    const rawKind = str(f.kind ?? f.type, 24).toLowerCase()
+    let kind = FACT_KINDS.has(rawKind) ? rawKind : 'fact'
+    if (kind === 'fact') {
+      if (rawCall || rawKind === 'name' || rawKind === 'nickname' || rawKind === 'call') kind = 'address'
+      else if (rawKind === 'plan' || rawKind === 'schedule' || rawKind === 'appointment') kind = 'promise'
+      else if (rawKind === 'like' || rawKind === 'hobby' || rawKind === 'habit') kind = 'preference'
+    }
+    const rawText = str(f.text ?? f.content ?? f.fact ?? f.summary ?? f.description ?? f.value, 80)
+      || (rawCall ? `对方希望我喊他${rawCall}` : '')
+    if (!rawText) continue
+    const rawTier = str(f.tier, 16).toLowerCase()
+    const rawSens = str(f.sensitivity, 16).toLowerCase()
+    const rawDisc = str(f.disclosable, 16).toLowerCase()
+    facts.push({
+      kind,
+      text: rawText,
+      tier: TIERS.has(rawTier) ? rawTier : (kind === 'address' ? 'permanent' : 'season'),
+      sensitivity: SENSITIVITIES.has(rawSens) ? rawSens : 'personal',
+      disclosable: DISCLOSABLES.has(rawDisc) ? rawDisc : 'when-asked',
+      ...(rawCall ? { call: rawCall } : {}),
+    })
+  }
+
+  const rawAffect = obj.affect && typeof obj.affect === 'object' ? (obj.affect as Record<string, unknown>) : {}
+  const affectKindRaw = str(rawAffect.kind, 24).toLowerCase()
+  const intensityNum = Number(rawAffect.intensity)
+  const affect = {
+    kind: AFFECT_SET.has(affectKindRaw) ? affectKindRaw : 'neutral',
+    intensity: Number.isFinite(intensityNum) ? Math.max(0, Math.min(1, intensityNum)) : 0.35,
+  }
+
+  const feelRaw = str(obj.relationFeel, 16)
+  return {
+    pragmaticNote: str(obj.pragmaticNote, 60),
+    facts,
+    affect,
+    happened: str(obj.happened, 80),
+    relationFeel: FEEL_SET.has(feelRaw) ? feelRaw : 'same',
+    tensionNote: str(obj.tensionNote, 90),
+    selfMistake: str(obj.selfMistake, 70),
+    signalKind: str(obj.signalKind, 32) || 'chat',
+    desireHint: str(obj.desireHint, 100),
+  }
+}
 
 export function isSelfNarration(text: string): boolean {
   const t = text.trim()
@@ -472,7 +545,8 @@ async function runUnifiedExtract(opts: {
       opts.store.logTrace({ traceId: opts.traceId, event: 'extract_no_json', level: 'warn', data: { raw: res.content.slice(0, 120) } })
       return null
     }
-    const parsed = UnifiedExtractSchema.safeParse(JSON.parse(match[0]))
+    const normalized = normalizeRawExtraction(JSON.parse(match[0]))
+    const parsed = UnifiedExtractSchema.safeParse(normalized)
     if (!parsed.success) {
       opts.store.logTrace({ traceId: opts.traceId, event: 'extract_schema_fail', level: 'warn', data: { issues: parsed.error.issues.slice(0, 3) } })
       return null
@@ -521,9 +595,9 @@ function applyExtraction(
       affect: extracted.affect.kind,
       createdAt: nowLocal(now),
     })
-    if (f.kind === 'address' && f.call) {
-      deps.relations.setCall(userId, f.call)
-      deps.store.logTrace({ traceId, event: 'call_changed', level: 'info', data: { userId, call: f.call } })
+    if (f.call?.trim()) {
+      deps.relations.setCall(userId, f.call.trim())
+      deps.store.logTrace({ traceId, event: 'call_changed', level: 'info', data: { userId, call: f.call.trim() } })
     }
   }
 

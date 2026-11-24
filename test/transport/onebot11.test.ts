@@ -65,10 +65,10 @@ describe('OneBot11 routing & bubble splitting', () => {
     assert.match(rich.textExtra, /须弥攻略/)
   })
 
-  it('splits bubbles cleanly, strips markdown, and keeps lists intact', () => {
+  it('splits bubbles cleanly, strips markdown and trailing periods, and keeps lists intact', () => {
     const bubbles = splitReply('**今天**风不大。\n\n- 逛市集\n- 看花\n\n你要一起去吗？')
     assert.equal(bubbles.length, 3)
-    assert.equal(bubbles[0], '今天风不大。')
+    assert.equal(bubbles[0], '今天风不大')
     assert.equal(bubbles[1], '- 逛市集\n- 看花')
     assert.equal(bubbles[2], '你要一起去吗？')
   })
