@@ -9,6 +9,8 @@ import { resolveEnvValue } from '../shared/time.ts'
 import type { InMemoryToolRegistry } from './registry.ts'
 
 const MAX_WEB_FETCH_BYTES = 512 * 1024
+const MAX_WEB_REDIRECTS = 3
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
 
 export type DnsLookupFn = (hostname: string) => Promise<Array<{ address: string; family: number }>>
 
@@ -199,14 +201,14 @@ async function resolveAndVerifyHost(
   return records[0]!
 }
 
-// 绑定已验证 IP 发起 HTTP/HTTPS 请求：阻断 DNS 重绑定、拒绝自动 3xx 重定向、强制流式字节预算
+// 绑定已验证 IP 发起单跳 HTTP/HTTPS 请求：阻断 DNS 重绑定、返回 location 由上层逐跳重验、强制流式字节预算
 async function pinnedPublicHttpGet(
   rawUrl: string,
   pinned: { address: string; family: number },
   maxBytes: number,
   timeoutMs: number,
   signal?: AbortSignal,
-): Promise<{ status: number; contentType: string; text: string; overflowed: boolean }> {
+): Promise<{ status: number; contentType: string; location: string | null; text: string; overflowed: boolean }> {
   const u = new URL(rawUrl)
   const isHttps = u.protocol === 'https:'
   const reqFn = isHttps ? httpsRequest : httpRequest
@@ -233,9 +235,10 @@ async function pinnedPublicHttpGet(
       (res) => {
         const status = res.statusCode ?? 0
         const contentType = String(res.headers['content-type'] ?? '')
-        if (status >= 300 && status < 400) {
+        const location = typeof res.headers.location === 'string' ? res.headers.location : null
+        if (REDIRECT_STATUSES.has(status)) {
           res.resume()
-          resolveReq({ status, contentType, text: '', overflowed: false })
+          resolveReq({ status, contentType, location, text: '', overflowed: false })
           return
         }
         const chunks: Buffer[] = []
@@ -251,6 +254,7 @@ async function pinnedPublicHttpGet(
             resolveReq({
               status,
               contentType,
+              location: null,
               text: Buffer.concat(chunks).toString('utf8'),
               overflowed: true,
             })
@@ -264,6 +268,7 @@ async function pinnedPublicHttpGet(
             resolveReq({
               status,
               contentType,
+              location: null,
               text: Buffer.concat(chunks).toString('utf8'),
               overflowed: false,
             })
@@ -455,68 +460,92 @@ export function registerWebTools(registry: InMemoryToolRegistry, cfg: WebSearchC
     },
     async execute(args, ctx) {
       const { url } = FetchArgsSchema.parse(args)
-      if (!isSafePublicUrl(url)) {
-        return { output: '不能访问内网或非公开网址。', isError: true }
-      }
-      const parsedUrl = new URL(url)
+      let currentUrl = url
       let ctype = ''
       let raw = ''
 
-      if (cfg.fetchImpl) {
-        // 即使使用注入 fetch（单测或自定义适配器），依然校验 DNS（若提供 lookupImpl）、禁止自动跳转并执行流式字节预算
-        if (cfg.lookupImpl) {
-          const pinned = await resolveAndVerifyHost(parsedUrl.hostname, cfg.lookupImpl)
-          if (!pinned) return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
+      // 安全多跳重定向（最多 3 跳）：每一跳都重新校验公网 URL + DNS 解析 + IP 绑定，既支持短链/HTTPS 跳转又杜绝 302 打穿内网
+      for (let hop = 0; hop <= MAX_WEB_REDIRECTS; hop++) {
+        if (!isSafePublicUrl(currentUrl)) {
+          return { output: '不能访问内网或非公开网址。', isError: true }
         }
-        const timeout = AbortSignal.timeout(timeoutMs)
-        const combined = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout
-        let res: Response
-        try {
-          res = await cfg.fetchImpl(url, {
-            headers: { 'User-Agent': 'ZySoulBot/0.1 (companion reader)' },
-            redirect: 'error',
-            signal: combined,
-          })
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          return { output: `网页请求被拒绝或失败：${msg.slice(0, 120)}`, isError: true }
+        const parsedUrl = new URL(currentUrl)
+
+        if (cfg.fetchImpl) {
+          if (cfg.lookupImpl) {
+            const pinned = await resolveAndVerifyHost(parsedUrl.hostname, cfg.lookupImpl)
+            if (!pinned) return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
+          }
+          const timeout = AbortSignal.timeout(timeoutMs)
+          const combined = ctx.signal ? AbortSignal.any([ctx.signal, timeout]) : timeout
+          let res: Response
+          try {
+            res = await cfg.fetchImpl(currentUrl, {
+              headers: { 'User-Agent': 'ZySoulBot/0.1 (companion reader)' },
+              redirect: 'manual',
+              signal: combined,
+            })
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            return { output: `网页请求被拒绝或失败：${msg.slice(0, 120)}`, isError: true }
+          }
+          if (REDIRECT_STATUSES.has(res.status)) {
+            const loc = res.headers.get('location')
+            if (!loc || hop >= MAX_WEB_REDIRECTS) {
+              return { output: '网页重定向次数过多或目标无效。', isError: true }
+            }
+            try {
+              currentUrl = new URL(loc, currentUrl).toString()
+            } catch {
+              return { output: '网页重定向地址格式无效。', isError: true }
+            }
+            continue
+          }
+          if (!res.ok) {
+            return { output: `网页打开失败（HTTP ${res.status}）。`, isError: true }
+          }
+          ctype = res.headers.get('content-type') ?? ''
+          const bounded = await readStreamBounded(res, maxFetchBytes)
+          raw = bounded.text
+          break
+        } else {
+          const pinned = await resolveAndVerifyHost(parsedUrl.hostname, lookupImpl)
+          if (!pinned) {
+            return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
+          }
+          let fetched: { status: number; contentType: string; location: string | null; text: string; overflowed: boolean }
+          try {
+            fetched = await pinnedPublicHttpGet(currentUrl, pinned, maxFetchBytes, timeoutMs, ctx.signal)
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err)
+            return { output: `网页打开失败：${msg.slice(0, 120)}`, isError: true }
+          }
+          if (REDIRECT_STATUSES.has(fetched.status)) {
+            if (!fetched.location || hop >= MAX_WEB_REDIRECTS) {
+              return { output: '网页重定向次数过多或目标无效。', isError: true }
+            }
+            try {
+              currentUrl = new URL(fetched.location, currentUrl).toString()
+            } catch {
+              return { output: '网页重定向地址格式无效。', isError: true }
+            }
+            continue
+          }
+          if (fetched.status < 200 || fetched.status >= 300) {
+            return { output: `网页打开失败（HTTP ${fetched.status}）。`, isError: true }
+          }
+          ctype = fetched.contentType
+          raw = fetched.text
+          break
         }
-        if (res.status >= 300 && res.status < 400) {
-          return { output: '网页重定向被安全策略拦截。', isError: true }
-        }
-        if (!res.ok) {
-          return { output: `网页打开失败（HTTP ${res.status}）。`, isError: true }
-        }
-        ctype = res.headers.get('content-type') ?? ''
-        const bounded = await readStreamBounded(res, maxFetchBytes)
-        raw = bounded.text
-      } else {
-        const pinned = await resolveAndVerifyHost(parsedUrl.hostname, lookupImpl)
-        if (!pinned) {
-          return { output: '域名解析指向内网或非公开地址，已被拦截。', isError: true }
-        }
-        let fetched: { status: number; contentType: string; text: string; overflowed: boolean }
-        try {
-          fetched = await pinnedPublicHttpGet(url, pinned, maxFetchBytes, timeoutMs, ctx.signal)
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err)
-          return { output: `网页打开失败：${msg.slice(0, 120)}`, isError: true }
-        }
-        if (fetched.status >= 300 && fetched.status < 400) {
-          return { output: '网页重定向被安全策略拦截。', isError: true }
-        }
-        if (fetched.status < 200 || fetched.status >= 300) {
-          return { output: `网页打开失败（HTTP ${fetched.status}）。`, isError: true }
-        }
-        ctype = fetched.contentType
-        raw = fetched.text
       }
 
+      const finalHost = new URL(currentUrl).hostname
       const readable = ctype.includes('html') ? stripHtmlToText(raw) : raw.trim()
       const clipped = readable.slice(0, 2200)
       return {
         output: clipped || '页面没有可读正文。',
-        foldSummary: `读了网页 ${parsedUrl.hostname}：${clipped.slice(0, 50)}`,
+        foldSummary: `读了网页 ${finalHost}：${clipped.slice(0, 50)}`,
       }
     },
   })

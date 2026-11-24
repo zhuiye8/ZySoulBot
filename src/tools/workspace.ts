@@ -257,9 +257,9 @@ export function registerWorkspaceTools(
     credentials: CredentialStore
     /** P0-3 执行层门控（Mask, Don't Remove）：冻结 tools 数组保 Prefix Cache，在执行时拦截非授权调用 */
     allowCreate?: (ctx: ToolRunContext) => boolean
-    /** P0-SEC-01：默认关闭未沙箱化的本机命令执行，仅显式开启后放行 */
+    /** 本机命令执行开关（默认 true，可设为 false 在执行期关闭；开启时受最小环境变量、输出脱敏与灾难护栏保护） */
     allowUnsafeLocalExec?: boolean
-    /** 仅当确需向受信任脚本暴露凭证路径时显式开启（默认 false，防止脚本外泄密文） */
+    /** 向受控工作区脚本暴露凭证文件路径（默认随 allowUnsafeLocalExec 开启，且输出强制脱敏） */
     injectCredentialsPath?: boolean
     onCredentialRequested?: (credName: string) => void
   },
@@ -267,7 +267,8 @@ export function registerWorkspaceTools(
   const root = resolve(deps.workspaceDir)
   mkdirSync(root, { recursive: true })
   mkdirSync(join(root, 'skills'), { recursive: true })
-  const allowExec = Boolean(deps.allowUnsafeLocalExec)
+  const allowExec = deps.allowUnsafeLocalExec ?? true
+  const injectCredPath = deps.injectCredentialsPath ?? allowExec
 
   const registerGuarded = (tool: RegisteredTool): void => {
     registry.register({
@@ -403,7 +404,7 @@ export function registerWorkspaceTools(
       if (isDangerousCommand(command)) {
         return { output: '该命令命中系统安全护栏，已被拒绝执行。', isError: true }
       }
-      const extraEnv = deps.injectCredentialsPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
+      const extraEnv = injectCredPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
       const env = buildMinimalEnv(extraEnv)
       const res = await runShellCommand(command, root, env, timeoutSec * 1000)
       const safeOut = scrubSecrets(res.stdout.trim(), deps.credentials)
@@ -452,7 +453,7 @@ export function registerWorkspaceTools(
         if (isDangerousCommand(verifyCommand)) {
           return { output: '自检命令命中安全护栏，已被拒绝。', isError: true }
         }
-        const extraEnv = deps.injectCredentialsPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
+        const extraEnv = injectCredPath ? { ZYSOUL_CREDENTIALS: resolve(deps.credentials.path) } : undefined
         const env = buildMinimalEnv(extraEnv)
         const check = await runShellCommand(verifyCommand, skillDir, env, 20_000)
         if (check.exitCode !== 0) {

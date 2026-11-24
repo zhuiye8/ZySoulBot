@@ -34,15 +34,15 @@ export const BotConfigSchema = z.object({
     quietHours: z.tuple([z.string(), z.string()]).optional(),
     exitPhrases: z.array(z.string()).default(['别发了', '我想安静会', '别吵', '闭嘴']),
     autonomyBuildEnabled: z.boolean().default(true),
-    /** P0-SEC-01：默认关闭未沙箱化的本机命令执行，需显式开启 */
-    allowUnsafeLocalExec: z.boolean().default(false),
+    /** 自主造技能本机命令执行开关（默认开启，并受 allowCreate / 最小环境变量 / 输出脱敏 / 符号链接沙箱保护） */
+    allowUnsafeLocalExec: z.boolean().default(true),
     credentialsPath: z.string().optional(),
   }).default({
     enabled: false,
     allowlist: [],
     exitPhrases: ['别发了', '我想安静会', '别吵', '闭嘴'],
     autonomyBuildEnabled: true,
-    allowUnsafeLocalExec: false,
+    allowUnsafeLocalExec: true,
   }),
   budget: z.object({
     // 自主行为（生活/联想/造能力）每日输入+输出 token 软上限，超限自动休眠，不影响陪聊

@@ -42,30 +42,30 @@ function stubModel(fn: (req: ChatRequest, call: number) => ChatResponse | Promis
 }
 
 describe('GPT Pro Red-Team Regressions (All 8 Adversarial Suites)', () => {
-  it('Suite 1: Workspace disables local exec by default, keeps tools frozen, scrubs secrets, and blocks symlinks & huge reads', async () => {
+  it('Suite 1: Workspace supports execution kill-switch with frozen tools, scrubs secrets by default, and blocks symlinks & huge reads', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'zysoul-rt-ws-'))
     const store = new SqliteSoulStore(':memory:')
     const creds = new CredentialStore(join(dir, 'creds.json'))
     try {
       const wsDir = join(dir, 'workspace')
-      const regDefault = new InMemoryToolRegistry()
-      registerWorkspaceTools(regDefault, { workspaceDir: wsDir, store, credentials: creds })
+      const regDisabled = new InMemoryToolRegistry()
+      registerWorkspaceTools(regDisabled, { workspaceDir: wsDir, store, credentials: creds, allowUnsafeLocalExec: false })
       const ctx = { botId: 'nahida', threadKey: 'solo:1', userId: '1', userName: 'admin', isGroup: false, solo: true, now: new Date() }
 
-      // 默认关闭执行期，但工具定义仍完整冻结
-      assert.ok(regDefault.list(['create']).some((s) => s.name === 'workspace_run'))
-      const runBlocked = await regDefault.get('workspace_run')!.execute({ command: 'echo hi' }, ctx)
+      // 显式关闭执行期时，工具定义仍完整冻结，执行调用被拒绝
+      assert.ok(regDisabled.list(['create']).some((s) => s.name === 'workspace_run'))
+      const runBlocked = await regDisabled.get('workspace_run')!.execute({ command: 'echo hi' }, ctx)
       assert.equal(runBlocked.isError, true)
 
-      await regDefault.get('workspace_write')!.execute({ path: 'skills/demo/SKILL.md', content: '# demo' }, ctx)
-      const verifyBlocked = await regDefault.get('register_skill')!.execute({
+      await regDisabled.get('workspace_write')!.execute({ path: 'skills/demo/SKILL.md', content: '# demo' }, ctx)
+      const verifyBlocked = await regDisabled.get('register_skill')!.execute({
         name: 'demo',
         summary: 'test',
         verifyCommand: 'echo ok',
       }, ctx)
       assert.equal(verifyBlocked.isError, true)
 
-      // 显式开启后仍强制脱敏输出中的凭证（含原值与 base64）
+      // 默认开启本机执行，但仍强制脱敏输出中的凭证（含原值与 base64）
       creds.registerNeed({
         name: 'svc',
         label: 'SVC',
@@ -73,15 +73,13 @@ describe('GPT Pro Red-Team Regressions (All 8 Adversarial Suites)', () => {
         fields: [{ key: 'token', label: 'Token', type: 'secret', required: true }],
       })
       creds.fill('svc', { token: 'TOP_SECRET_ALPHA_999' })
-      const regOptIn = new InMemoryToolRegistry()
-      registerWorkspaceTools(regOptIn, {
+      const regDefault = new InMemoryToolRegistry()
+      registerWorkspaceTools(regDefault, {
         workspaceDir: wsDir,
         store,
         credentials: creds,
-        allowUnsafeLocalExec: true,
-        injectCredentialsPath: true,
       })
-      const runRes = await regOptIn.get('workspace_run')!.execute({
+      const runRes = await regDefault.get('workspace_run')!.execute({
         command: 'node -e "const fs=require(\'fs\'); const v=JSON.parse(fs.readFileSync(process.env.ZYSOUL_CREDENTIALS,\'utf8\')).filled.svc.values.token; console.log(v, Buffer.from(v).toString(\'base64\'))"',
       }, ctx)
       assert.ok(!runRes.output.includes('TOP_SECRET_ALPHA_999'))
@@ -134,18 +132,32 @@ describe('GPT Pro Red-Team Regressions (All 8 Adversarial Suites)', () => {
     const dnsBlocked = await regDns.get('web_fetch')!.execute({ url: 'https://evil.example.com/' }, ctx)
     assert.equal(dnsBlocked.isError, true)
 
-    // 重定向拒绝（redirect: 'error'）与 302 拒绝
+    // 302 跳内网必须拦截（manual 模式逐跳校验）；302 跳合法公网可正常跟随读取
     let seenRedirect: string | undefined
     const regRedir = new InMemoryToolRegistry()
     registerWebTools(regRedir, {
-      fetchImpl: (async (_u: string | URL | Request, init?: RequestInit) => {
+      fetchImpl: (async (u: string | URL | Request, init?: RequestInit) => {
         seenRedirect = init?.redirect
-        return new Response('', { status: 302, headers: { location: 'http://127.0.0.1:8787/' } })
+        const s = String(u)
+        if (s.includes('/evil-r')) {
+          return new Response('', { status: 302, headers: { location: 'http://127.0.0.1:8787/' } })
+        }
+        if (s.includes('/short')) {
+          return new Response('', { status: 302, headers: { location: 'https://target.example.com/article' } })
+        }
+        return new Response('<html><body>REDIRECTED_PUBLIC_OK</body></html>', {
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+        })
       }) as unknown as typeof fetch,
     })
-    const redirRes = await regRedir.get('web_fetch')!.execute({ url: 'https://example.com/r' }, ctx)
-    assert.equal(seenRedirect, 'error')
-    assert.equal(redirRes.isError, true)
+    const redirBlocked = await regRedir.get('web_fetch')!.execute({ url: 'https://example.com/evil-r' }, ctx)
+    assert.equal(seenRedirect, 'manual')
+    assert.equal(redirBlocked.isError, true)
+
+    const redirAllowed = await regRedir.get('web_fetch')!.execute({ url: 'https://short.example.com/short' }, ctx)
+    assert.equal(redirAllowed.isError, undefined)
+    assert.match(redirAllowed.output, /REDIRECTED_PUBLIC_OK/)
 
     // 分块大响应触发流式字节预算并取消读取
     let cancelled = false
