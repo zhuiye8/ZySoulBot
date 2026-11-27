@@ -507,6 +507,8 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
     batchers.push(privateBatcher, groupBatcher)
 
     if (botCfg.napcatWs) {
+      // 未在白名单内的群/用户每小时至多记录 1 条 access_denied，避免刷屏灌爆 SQLite WAL
+      const deniedLogAt = new Map<string, number>()
       transport = createOneBot11Transport({
         botId: botCfg.id,
         url: botCfg.napcatWs,
@@ -518,7 +520,12 @@ export function createApp(config: ZysoulConfig, deps: AppDeps = {}): AppHandle {
         },
         onMessage: (msg) => {
           if (!accessAllowed(botCfg.access, { userId: msg.userId, groupId: msg.groupId })) {
-            store.logTrace({ traceId: 'access', event: 'access_denied', level: 'info', data: { userId: msg.userId, groupId: msg.groupId } })
+            const key = msg.groupId ? `g:${msg.groupId}` : `u:${msg.userId}`
+            const nowMs = clock.now().getTime()
+            if (nowMs - (deniedLogAt.get(key) ?? 0) >= 3_600_000) {
+              deniedLogAt.set(key, nowMs)
+              store.logTrace({ traceId: 'access', event: 'access_denied', level: 'info', data: { userId: msg.userId, groupId: msg.groupId } })
+            }
             return
           }
           if (msg.messageType === 'private') privateBatcher.push(msg.threadKey, msg)

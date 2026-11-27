@@ -28,6 +28,13 @@ const NoteThoughtArgsSchema = z.object({
   exitKind: z.enum(['experience', 'create_work', 'social', 'build_skill']).default('experience'),
 })
 
+const SaveWorkArgsSchema = z.object({
+  kind: z.enum(['poem', 'note']).default('note'),
+  title: z.string().min(1).max(60),
+  content: z.string().min(5).max(4000),
+  moodNote: z.string().max(120).optional(),
+})
+
 export function registerSelfLifeTools(
   registry: InMemoryToolRegistry,
   deps: { store: SoulStore; diary: DiaryBook; desires?: DesireEngine },
@@ -175,6 +182,44 @@ export function registerSelfLifeTools(
       return {
         output: `已经记在心里了：${want}`,
         foldSummary: `记下念头：${want.slice(0, 30)}`,
+      }
+    },
+  })
+
+  registry.register({
+    layer: 'create',
+    spec: {
+      name: 'save_work',
+      description: '把自己写好的小诗、随笔、设计方案或手工笔记正式存进作品集。',
+      parameters: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['poem', 'note'], description: '作品类型：poem（诗/词）或 note（笔记/设计）' },
+          title: { type: 'string', description: '作品标题' },
+          content: { type: 'string', description: '作品正文内容' },
+          moodNote: { type: 'string', description: '可选，做完这件东西时的简短心境' },
+        },
+        required: ['title', 'content'],
+      },
+    },
+    async execute(args, ctx) {
+      const { kind, title, content, moodNote } = SaveWorkArgsSchema.parse(args)
+      const id = `work_${randomUUID().slice(0, 8)}`
+      deps.store.upsertWork({
+        id,
+        kind,
+        title: title.trim(),
+        content: content.trim(),
+        mediaPath: null,
+        status: 'ready',
+        externalTaskId: null,
+        forUser: ctx.solo ? null : ctx.userId,
+        moodNote: moodNote?.trim() ?? null,
+        createdAt: nowLocal(ctx.now),
+      })
+      return {
+        output: `作品《${title.trim()}》已经收进作品集里了（id=${id}）。`,
+        foldSummary: `存下作品《${title.trim()}》`,
       }
     },
   })

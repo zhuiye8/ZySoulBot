@@ -110,11 +110,11 @@ export function checkBuildScope(
 const ShapeItemSchema = z.object({
   id: z.string().min(1),
   exitKind: z.enum(['experience', 'create_work', 'social', 'build_skill']),
-  skillAction: z.enum(['reuse', 'extend', 'create']).optional(),
-  skillName: z.string().max(40).optional(),
-  basedOn: z.string().max(40).optional(),
-  spec: z.string().max(400).optional(),
-  needsCredential: z.boolean().optional(),
+  skillAction: z.enum(['reuse', 'extend', 'create']).nullable().optional(),
+  skillName: z.string().max(40).nullable().optional(),
+  basedOn: z.string().max(40).nullable().optional(),
+  spec: z.string().max(400).nullable().optional(),
+  needsCredential: z.boolean().nullable().optional(),
   blocker: z.object({
     kind: z.enum(['approval', 'allow-person']),
     what: z.string().min(1).max(160),
@@ -128,13 +128,13 @@ const ShapeResponseSchema = z.object({
 // ── 空闲自发联想 Schema ───────────────────────────────────────────────
 const MindWanderSchema = z.object({
   kind: z.enum(['none', 'feeling', 'thought']),
-  affect: z.enum(EMOTION_KINDS).optional(),
-  intensity: z.number().min(0).max(1).optional(),
-  feelingNote: z.string().max(80).optional(),
-  want: z.string().max(120).optional(),
-  why: z.string().max(160).optional(),
-  exitKind: z.enum(['experience', 'create_work', 'social']).optional(),
-  aboutUser: z.string().max(32).optional(),
+  affect: z.enum(EMOTION_KINDS).nullable().optional(),
+  intensity: z.number().min(0).max(1).nullable().optional(),
+  feelingNote: z.string().max(80).nullable().optional(),
+  want: z.string().max(120).nullable().optional(),
+  why: z.string().max(160).nullable().optional(),
+  exitKind: z.enum(['experience', 'create_work', 'social', 'build_skill']).nullable().optional(),
+  aboutUser: z.string().max(32).nullable().optional(),
 })
 
 export interface DesireEngineConfig {
@@ -146,6 +146,7 @@ export class DesireEngine {
   private store: SoulStore
   readonly maxActive: number
   readonly ttlMs: number
+  private recentWandered = new Map<string, number>()
 
   constructor(store: SoulStore, cfg: DesireEngineConfig = {}) {
     this.store = store
@@ -425,21 +426,34 @@ ${caps.length ? caps.map((c) => `- ${c.name}：${c.summary}`).join('\n') : '（�
     opts: { traceId: string; now?: Date; signal?: AbortSignal },
   ): Promise<{ kind: 'none' | 'feeling' | 'thought'; detail?: string }> {
     const now = opts.now ?? new Date()
+    const nowMs = now.getTime()
     const rand = deps.random ?? Math.random
     const pool = this.store.recentMemories(80)
     if (pool.length === 0) return { kind: 'none' }
 
-    // 偏向抽取久远或高留存的记忆，制造“忽然想起”的质感
-    const pick: MemoryItem = pool[Math.floor(rand() * pool.length)]!
+    // 清理 24 小时前的联想冷却记录，防止同一批记忆在几小时内反复抽中形成“情绪回声室”
+    const wanderCooldownMs = 24 * 3_600_000
+    for (const [id, ts] of this.recentWandered) {
+      if (nowMs - ts >= wanderCooldownMs) this.recentWandered.delete(id)
+    }
+    const freshPool = pool.filter((m) => !this.recentWandered.has(m.id))
+    if (freshPool.length === 0) return { kind: 'none' }
+
+    // 优先抽取外部/共同经历记忆（L0/L1），降低纯内部随想（L2）自我循环概率
+    const nonInternal = freshPool.filter((m) => m.provenance !== 'L2_internal')
+    const candidates = nonInternal.length > 0 ? nonInternal : freshPool
+    const pick: MemoryItem = candidates[Math.floor(rand() * candidates.length)]!
+    this.recentWandered.set(pick.id, nowMs)
+
     const system = `你就是${deps.persona.name}。${deps.persona.summary || deps.persona.identity.slice(0, 140)}
 现在是 ${timeHHMM(now)}，身边安静，没人找你说话。刚才脑海里忽然浮起一条记忆。
-它有没有让你联想到什么？什么都没想出来是最正常的（选 none），绝不硬凑。
+它有没有让你联想到什么？什么都没想出来是最正常的（选 none），绝不硬凑，也不要反复套用同一种比喻或套话。
 只输出严格 JSON：
 - 没特别想法：{"kind":"none"}
 - 只是心里泛起一点情绪：{"kind":"feeling","affect":"affection|curiosity|sadness|humor|neutral","intensity":0.35,"feelingNote":"一句话"}
-- 冒出一个想做的念头：{"kind":"thought","want":"我想...","why":"刚想起...","exitKind":"experience|create_work|social","aboutUser":"若冲着具体人填其ID，否则留空"}`
+- 冒出一个想做的念头：{"kind":"thought","want":"我想...","why":"刚想起...","exitKind":"experience|create_work|social|build_skill","aboutUser":"若冲着具体人填其ID，否则留空"}`
 
-    const user = `此刻状态：\n${deps.body.renderBodyFacts(now)}\n\n浮上来的记忆（${pick.createdAt.slice(0, 10)}）：\n${pick.text}${pick.about.length ? `\n（相关人：${pick.about.join('、')}）` : ''}`
+    const user = `此刻状态：\n${deps.body.renderBodyFacts(now, undefined, { includeInternalCauses: false })}\n\n浮上来的记忆（${pick.createdAt.slice(0, 10)}）：\n${pick.text}${pick.about.length ? `\n（相关人：${pick.about.join('、')}）` : ''}`
 
     try {
       const res = await deps.model.complete({
@@ -466,16 +480,17 @@ ${caps.length ? caps.map((c) => `- ${c.name}：${c.summary}`).join('\n') : '（�
       if (!parsed.success || parsed.data.kind === 'none') return { kind: 'none' }
 
       if (parsed.data.kind === 'feeling' && parsed.data.affect && parsed.data.affect !== 'neutral') {
+        const note = parsed.data.feelingNote || `忽然想起：${pick.text.slice(0, 40)}`
         deps.body.appraise({
           source: 'life',
           affectKind: parsed.data.affect as AffectKind,
           intensity: parsed.data.intensity ?? 0.35,
           confidence: 0.7,
-          text: parsed.data.feelingNote || `忽然想起：${pick.text.slice(0, 40)}`,
+          text: note,
           now,
         })
         this.store.logTrace({ traceId: opts.traceId, event: 'mind_wander_feeling', level: 'info', data: { affect: parsed.data.affect, memId: pick.id } })
-        return { kind: 'feeling', detail: parsed.data.feelingNote }
+        return { kind: 'feeling', detail: note }
       }
 
       if (parsed.data.kind === 'thought' && parsed.data.want && parsed.data.why) {

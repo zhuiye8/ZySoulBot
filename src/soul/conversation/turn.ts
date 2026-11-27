@@ -316,12 +316,34 @@ export async function runConversationTurn(deps: ConversationDeps, input: TurnInp
     dynamicParts.push(`相关世界记忆：\n${worldSnippet}`)
   }
 
-  // v2.1 反谄媚：仅在冲突/高张力/冷淡短词回合（约 15% 回合）启用普通 Chat 模式下的选择性 <inner> 隐藏独白，
-  // 严禁在静态 System 修改或开启 DeepSeek Thinking+tools；只提供私密消化区，绝不规定回复立场。
+  // HumanLM 启发式轻量隐状态对齐（0 训练、保 Prefix Cache）：
+  // 冲突/低落/冷淡、初见陌生/刚认识阶段、或连续发问回合时，启用 1 句隐藏 <inner> 锚定「立场 + 目的 + 表达节奏」；
+  // 严禁改写静态 System 或开启 DeepSeek Thinking+tools，只给私密锚点区，绝不替角色做决定。
+  const recentAssistant = input.mode === 'chat'
+    ? history.filter((m) => m.role === 'assistant').slice(-2)
+    : []
+  const lastEndedWithQuestion = recentAssistant.length > 0
+    && /[？?]\s*$/.test(recentAssistant[recentAssistant.length - 1]!.content.trim())
+  const consecutiveQuestions = recentAssistant.filter((m) => /[？?]\s*$/.test(m.content.trim())).length
+  if (input.mode === 'chat' && lastEndedWithQuestion) {
+    dynamicParts.push(
+      consecutiveQuestions >= 2
+        ? '你刚才连续两轮都在句尾反问对方了。'
+        : '你上一轮已经在句尾问过对方问题了。',
+    )
+  }
+
   const useInnerMonologue = input.mode === 'chat'
-    && (isStrained || bodyState.pad.p < deps.body.baseline.p - 0.16 || COLD_OR_HOSTILE_RE.test(input.text))
+    && (
+      isStrained
+      || bodyState.pad.p < deps.body.baseline.p - 0.16
+      || COLD_OR_HOSTILE_RE.test(input.text)
+      || rel.stage === 'stranger'
+      || rel.stage === 'acquaintance'
+      || lastEndedWithQuestion
+    )
   if (useInnerMonologue) {
-    dynamicParts.push('（这一轮你可以先用 <inner>...</inner> 写一两句只给自己看的内心真实想法，再写出要发给他的话；<inner> 里的内容不会发给对方，也不会记进对话历史。）')
+    dynamicParts.push('（开口前可先用 <inner>...</inner> 写一句只给自己看的简短锚点：此刻你对他的立场、这句的真实目的、以及表达节奏——比如是否直接说完就停而不刻意反问；<inner> 里的内容不会发给对方，也不会记进对话历史。）')
   }
 
   // 3) 跑灵魂原生轻量 Agent Loop（P0-3：默认固定一致的工具层顺序，保 Prefix Cache）
@@ -578,10 +600,11 @@ function applyExtraction(
 ): void {
   const { extracted, userId, who, threadKey, isGroup, userText, now, traceId } = ctx
 
-  // 1) 写入事实记忆（L0_external 一手用户陈述）+ 联动改称呼
+  // 1) 写入事实记忆（L0_external 一手用户陈述）+ 联动改称呼与旧称呼记忆双时态失效
+  const stamp = nowLocal(now)
   for (const f of extracted.facts.slice(0, 2)) {
     if (isSelfNarration(f.text)) continue
-    deps.memory.remember({
+    const saved = deps.memory.remember({
       kind: 'fact',
       text: f.text,
       about: [userId],
@@ -593,11 +616,28 @@ function applyExtraction(
       provenance: 'L0_external',
       threadKey,
       affect: extracted.affect.kind,
-      createdAt: nowLocal(now),
+      createdAt: stamp,
     })
-    if (f.call?.trim()) {
-      deps.relations.setCall(userId, f.call.trim())
-      deps.store.logTrace({ traceId, event: 'call_changed', level: 'info', data: { userId, call: f.call.trim() } })
+    const nextCall = f.call?.trim() ?? ''
+    if (nextCall) {
+      const prevRel = deps.relations.get(userId)
+      const prevCall = prevRel.callName
+      const changed = !prevRel.customCall || prevCall !== nextCall
+      if (changed) {
+        deps.relations.setCall(userId, nextCall)
+        // 旧名字/称呼事实标记为已失效，防止旧昵称继续被高频召回引发认知分裂
+        for (const old of deps.store.memoriesAbout(userId, 20)) {
+          if (saved && old.id === saved.id) continue
+          if (old.kind !== 'fact') continue
+          if (old.text.includes(nextCall)) continue
+          const mentionsOld = (prevCall && prevCall !== userId && old.text.includes(prevCall))
+            || /(名字|昵称|叫他|叫她|称呼)/.test(old.text)
+          if (mentionsOld) {
+            deps.store.invalidateMemory(old.id, saved?.id ?? null, stamp)
+          }
+        }
+        deps.store.logTrace({ traceId, event: 'call_changed', level: 'info', data: { userId, from: prevCall, call: nextCall } })
+      }
     }
   }
 

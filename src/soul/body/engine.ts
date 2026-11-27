@@ -92,6 +92,7 @@ export class BodyEngine {
   readonly traits: Required<Traits>
   readonly baseline: PAD
   private recentNeg: Array<{ kind: AffectKind; at: number }> = []
+  private lastAwakeAtMs = 0
 
   constructor(store: SoulStore, traits?: Traits, baseline?: PAD) {
     this.store = store
@@ -134,7 +135,7 @@ export class BodyEngine {
   }
 
   // 墙钟演化：PAD/Mood 回基线（负面心境衰减更慢，不装作秒忘），驱力缓慢回升，精力按昼夜节律演化。
-  tick(now: Date = new Date()): BodyState {
+  tick(now: Date = new Date(), opts?: { awake?: boolean }): BodyState {
     const s = this.state(now)
     const last = Date.parse(s.lastTickAt)
     const dtHours = Number.isFinite(last) ? (now.getTime() - last) / 3_600_000 : 0
@@ -155,8 +156,12 @@ export class BodyEngine {
     }
 
     const hour = now.getHours()
-    const isLateNight = hour >= 23 || hour < 6
-    if (isLateNight && !s.activity && dtHours >= 2) {
+    const isLateNight = hour >= 23 || hour < 7
+    const awakeDeltaMs = this.lastAwakeAtMs > 0 ? now.getTime() - this.lastAwakeAtMs : Number.POSITIVE_INFINITY
+    const recentlyAwake = Boolean(opts?.awake) || (awakeDeltaMs >= 0 && awakeDeltaMs < 20 * 60_000)
+
+    // 深夜无活动且近 20 分钟没有聊天耗能 → 视为正常睡眠，按 5 分钟 tick 持续恢复精力并偿还睡眠债
+    if (isLateNight && !s.activity && !recentlyAwake) {
       s.energy = clamp(s.energy + dtHours * 0.14, 0.15, 0.95)
       s.sleepDebt = clamp(s.sleepDebt - dtHours * 0.18, 0, 1)
     } else if (isLateNight) {
@@ -176,11 +181,12 @@ export class BodyEngine {
 
   // 说话或执行重活真实消耗精力（深夜聊越久越困）
   spendEnergy(cost: number, now: Date = new Date()): BodyState {
-    const s = this.tick(now)
+    const s = this.tick(now, { awake: true })
+    this.lastAwakeAtMs = now.getTime()
     const hour = now.getHours()
-    const nightMult = hour >= 23 || hour < 6 ? 1.8 : 1
+    const nightMult = hour >= 23 || hour < 7 ? 1.8 : 1
     s.energy = clamp(s.energy - Math.max(0, cost) * nightMult, 0.05, 1)
-    if (hour >= 23 || hour < 6) {
+    if (hour >= 23 || hour < 7) {
       s.sleepDebt = clamp(s.sleepDebt + cost * 0.9, 0, 1)
     }
     s.updatedAt = nowLocal(now)
@@ -308,12 +314,18 @@ export class BodyEngine {
   }
 
   // 生成“事实化、无指令”的此刻身心描述（用于末尾动态块，绝不报裸数字）。
-  renderBodyFacts(now: Date = new Date(), hoursSinceContact?: number): string {
+  renderBodyFacts(
+    now: Date = new Date(),
+    hoursSinceContact?: number,
+    opts?: { includeInternalCauses?: boolean },
+  ): string {
     const s = this.tick(now)
     const lines: string[] = []
+    const includeInternal = opts?.includeInternalCauses !== false
 
-    // 1) 最近 6 小时内真实发生过的情绪来由（最多 2 条）
-    const causes = this.store.recentEmotionCauses(4).filter((c) => {
+    // 1) 最近 6 小时内真实发生过的情绪来由（最多 2 条；内部联想时可过滤自身 L2 来由防止回声室）
+    const causes = this.store.recentEmotionCauses(6).filter((c) => {
+      if (!includeInternal && c.source === 'life') return false
       const t = Date.parse(c.createdAt.replace(' ', 'T'))
       return Number.isFinite(t) && now.getTime() - t < 6 * 3_600_000
     }).slice(-2)
@@ -326,8 +338,14 @@ export class BodyEngine {
       lines.push(h >= 24 ? `已经 ${Math.floor(h / 24)} 天没人来找你说话了。` : '今天一直很安静，没什么人来找你。')
     }
 
-    // 2) 身体精力与睡眠债感受（客观陈述）
-    if (s.energy < 0.28 || s.sleepDebt > 0.65) {
+    // 2) 身体精力与睡眠债感受（客观陈述；深夜原本在休息时给出真实困意）
+    const hour = now.getHours()
+    const isLateNight = hour >= 23 || hour < 7
+    const awakeDeltaMs = this.lastAwakeAtMs > 0 ? now.getTime() - this.lastAwakeAtMs : Number.POSITIVE_INFINITY
+    const wasResting = isLateNight && !s.activity && !(awakeDeltaMs >= 0 && awakeDeltaMs < 20 * 60_000)
+    if (wasResting) {
+      lines.push('现在是深夜，你本来已经准备睡了，被消息吵醒还有点迷糊。')
+    } else if (s.energy < 0.28 || s.sleepDebt > 0.65) {
       lines.push('眼皮有点沉，脑子转得比平时慢一点。')
     } else if (s.energy < 0.48) {
       lines.push('稍微有点累，精力不太满。')

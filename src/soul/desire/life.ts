@@ -56,6 +56,16 @@ export function looksTruncated(text: string): boolean {
   return false
 }
 
+const NIGHT_BOUND_DESIRE_RE = /(深夜|半夜|今晚|这么晚|夜里醒着|还不睡|没睡)/
+
+const SLOT_LABEL: Record<string, string> = {
+  morning: '上午',
+  noon: '中午',
+  afternoon: '下午',
+  evening: '晚上',
+  night: '深夜',
+}
+
 // ── 1) 纯代码收集社交动机（0 token，纯事实描述）────────────────────────
 export function collectSocialMotives(opts: {
   now: Date
@@ -65,6 +75,9 @@ export function collectSocialMotives(opts: {
     name: string
     lastAtMs?: number
     lastText?: string
+    lastRole?: 'user' | 'assistant' | 'summary'
+    unansweredCount?: number
+    lastMsgAtMs?: number
     stage?: string
     turns?: number
     disengagement?: number
@@ -85,6 +98,18 @@ export function collectSocialMotives(opts: {
   const idByName = new Map(opts.people.map((p) => [p.name, p.userId]))
 
   const isHostile = (uid: string): boolean => byId.get(uid)?.stage === 'hostile'
+  const isUnansweredBlocked = (uid: string): boolean => {
+    const person = byId.get(uid)
+    if (!person || person.lastRole !== 'assistant') return false
+    // 已经连发 >=2 条对方未回 → 严格暂停主动打扰，直到对方回复
+    if ((person.unansweredCount ?? 1) >= 2) return true
+    // 已发 1 条未回 → 至少间隔 18 小时才允许再轻问一句
+    if (person.lastMsgAtMs !== undefined) {
+      const gapH = (opts.now.getTime() - person.lastMsgAtMs) / 3_600_000
+      if (gapH < 18) return true
+    }
+    return false
+  }
 
   for (const pr of opts.promises) {
     if (isHostile(pr.userId)) continue
@@ -135,6 +160,7 @@ export function collectSocialMotives(opts: {
     }
 
     if (p.lastAtMs === undefined) continue
+    if (isUnansweredBlocked(p.userId)) continue
     const hours = (opts.now.getTime() - p.lastAtMs) / 3_600_000
     if (hours < 6) continue
     const span = hours >= 48 ? `${Math.floor(hours / 24)} 天` : `${Math.round(hours)} 小时`
@@ -146,6 +172,8 @@ export function collectSocialMotives(opts: {
     })
   }
 
+  const nowHour = opts.now.getHours()
+  const isNightNow = nowHour >= 22 || nowHour < 6
   for (const d of opts.socialDesires) {
     let target = d.aboutUser
     if (!target) {
@@ -156,11 +184,20 @@ export function collectSocialMotives(opts: {
         }
       }
     }
-    if (!target || isHostile(target)) continue
+    if (!target || isHostile(target) || isUnansweredBlocked(target)) continue
+    const createdMs = Date.parse(d.createdAt.replace(' ', 'T'))
+    const ageH = Number.isFinite(createdMs) ? Math.max(0, (opts.now.getTime() - createdMs) / 3_600_000) : 0
+    // 拦截过期的深夜场景型念头（例如凌晨种下“对方深夜醒着干嘛”，白天 16:48 绝不拿出来问“你那边现在是深夜吧”）
+    if (ageH >= 4 && !isNightNow && NIGHT_BOUND_DESIRE_RE.test(d.want)) continue
+    const ageLabel = ageH >= 24
+      ? `${Math.floor(ageH / 24)} 天前`
+      : ageH >= 1
+        ? `${Math.round(ageH)} 小时前`
+        : '刚才'
     out.push({
       kind: 'social_desire',
       userId: target,
-      fact: `你心里有件事想跟${nameOf.get(target) ?? '他'}说：「${d.want}」`,
+      fact: `你心里有件事想跟${nameOf.get(target) ?? '他'}说（${ageLabel}、${d.createdAt.slice(5, 16)} 冒出的念头）：「${d.want}」`,
       weight: Math.min(0.75, 0.4 + d.strength * 0.35),
       ref: d.id,
     })
@@ -386,13 +423,18 @@ export async function composeActivityThinking(
 
 export async function composeOutreach(
   deps: { model: ChatModel; store: SoulStore; persona: PersonaPack; priceTable?: PriceTable },
-  inp: { traceId: string; purpose: string; relationFacts: string; memoryFacts: string; bodyFacts: string },
+  inp: { traceId: string; purpose: string; relationFacts: string; memoryFacts: string; bodyFacts: string; now?: Date },
   signal?: AbortSignal,
 ): Promise<string | null> {
+  const now = inp.now ?? new Date()
+  const slotLabel = SLOT_LABEL[timeSlotOf(now)] ?? ''
   const greetings = deps.persona.greeting.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean)
   const anchor = greetings.length > 0 ? greetings[Math.floor(Math.random() * greetings.length)]! : ''
-  const system = `你就是${deps.persona.name}。${deps.persona.identity.slice(0, 1000)}\n现在你想主动给对方发一条消息（不是回复，是你先开口）。只说要说的话，自然简短。`
+  const system = `你就是${deps.persona.name}。${deps.persona.identity.slice(0, 1000)}
+现在时间是 ${nowLocal(now)}（${slotLabel}）。你想主动给对方发一条消息（不是回复，是你先开口）。
+注意分清「现在是${slotLabel} ${timeHHMM(now)}」和「以前聊天时的时间」，绝不要把半夜的旧话题说成此刻是深夜。只说要说的话，自然简短。`
   const user = [
+    `现在时间：${nowLocal(now)}（${slotLabel}）`,
     `缘由：${inp.purpose}`,
     `关于眼前人：\n${inp.relationFacts}`,
     ...(inp.memoryFacts ? [`记得的相关事：\n${inp.memoryFacts}`] : []),

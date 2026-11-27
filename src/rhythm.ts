@@ -119,6 +119,8 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
   const lastActMs = new Map<string, number>()
   const reflectedOnDay = new Map<string, string>()
   const inFlightDesires = new Set<string>()
+  const desireCooldownUntil = new Map<string, number>()
+  const desireExhaustedCount = new Map<string, number>()
 
   const reportError = (bot: RhythmBot | null, phase: string, err: unknown): void => {
     const msg = err instanceof Error ? err.message : String(err)
@@ -186,8 +188,8 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
       needsCredentialHint = scope.requiresCredential
     }
 
+    const prevLastProgressAt = desire.lastProgressAt
     desire.stage = 'in_progress'
-    desire.lastProgressAt = nowLocal(now)
     desire.updatedAt = nowLocal(now)
     soul.store.upsertDesire(desire)
     inFlightDesires.add(desire.id)
@@ -196,13 +198,16 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
     const specNote = desire.spec
       ? `\n工程参考：${JSON.stringify(desire.spec)}`
       : ''
+    const prevNote = desire.progressNote
+      ? `\n上次推进进度：${desire.progressNote}\n请直接基于已有进度续做或收尾，不要从头重复读取已经看过的文件。`
+      : ''
     const credNote = needsCredentialHint
       ? '\n这件事需要外部服务密钥：先调研该服务所需字段，调用 request_credential 登记，登记完就暂停等他填好，不要硬猜密钥。'
       : ''
     const prompt = `（这是你自己心里冒出来想做的事，没人要求你）
 你想做：${desire.want}
-起因：${desire.why}${specNote}${credNote}
-请直接用你的工具推进这件事：查资料、写脚本并调 register_skill 自检，或者把感想/作品写下来。做完用你自己的话简短总结结果；如果卡在缺凭证或没做成，如实说清楚。`
+起因：${desire.why}${specNote}${prevNote}${credNote}
+请直接用你的工具推进这件事：查资料、写脚本并调 register_skill 自检，或者把诗/笔记/设计方案用 save_work 存进作品集、把感想写进日记。做完用你自己的话简短总结结果；如果卡在缺凭证或没做成，如实说清楚。`
 
     try {
       const out = await soul.handleTurn({
@@ -213,7 +218,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         text: prompt,
         toolLayers: ['explore', 'express', 'create'],
         reasoningEffort: desire.exitKind === 'build_skill' ? 'high' : 'low',
-        maxSteps: desire.exitKind === 'build_skill' ? 14 : 6,
+        maxSteps: desire.exitKind === 'build_skill' ? 14 : desire.exitKind === 'create_work' ? 10 : 6,
       })
 
       // P1-STATE-04：跨 await 回写前重新读取最新状态，若期间已被管理员放弃/变更则绝不覆盖为 fulfilled
@@ -235,17 +240,28 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
         return
       }
 
-      // P1-LOOP-01：步数耗尽/失败/取消绝不误判 fulfilled，保留 active 以便后续继续推进
+      // P1-LOOP-01：步数耗尽/失败/取消绝不误判 fulfilled；不刷新 lastProgressAt，加入 4h 冷却，连续 3 次未收口则自然淡去防烧预算
       if (out.stopReason !== 'completed') {
-        latest.stage = 'active'
-        latest.progressNote = `本轮未完全收口（${out.stopReason}）：${(out.reply || out.toolSummaries.join('；') || '稍后继续').slice(0, 140)}`
-        latest.lastProgressAt = nowLocal(now)
+        const exhausted = (desireExhaustedCount.get(latest.id) ?? 0) + 1
+        desireCooldownUntil.set(latest.id, now.getTime() + 4 * 3_600_000)
+        if (exhausted >= 3) {
+          latest.stage = 'faded'
+          latest.progressNote = `连续 ${exhausted} 轮未完全收口，先放一放：${(out.reply || out.toolSummaries.join('；') || '稍后再说').slice(0, 120)}`
+          desireExhaustedCount.delete(latest.id)
+        } else {
+          latest.stage = 'active'
+          latest.progressNote = `本轮未完全收口（${out.stopReason}，第 ${exhausted} 次）：${(out.reply || out.toolSummaries.join('；') || '稍后继续').slice(0, 140)}`
+          desireExhaustedCount.set(latest.id, exhausted)
+        }
+        latest.lastProgressAt = prevLastProgressAt
         latest.updatedAt = nowLocal(now)
         soul.store.upsertDesire(latest)
-        soul.store.logTrace({ traceId, event: 'desire_incomplete', level: 'warn', data: { desireId: latest.id, stopReason: out.stopReason, steps: out.steps } })
+        soul.store.logTrace({ traceId, event: 'desire_incomplete', level: 'warn', data: { desireId: latest.id, stopReason: out.stopReason, steps: out.steps, exhausted } })
         return
       }
 
+      desireExhaustedCount.delete(latest.id)
+      desireCooldownUntil.delete(latest.id)
       latest.stage = 'fulfilled'
       latest.approvedPlanVersion = undefined
       latest.progressNote = (out.reply || out.toolSummaries.join('；') || '完成了').slice(0, 180)
@@ -414,6 +430,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           relationFacts: soul.relations.renderRelationFacts({ userId: admin, now, sharedStories: soul.memory.sharedStories(admin, 2) }),
           memoryFacts: '',
           bodyFacts: soul.body.renderBodyFacts(now),
+          now,
         },
       )
       if (text) {
@@ -453,6 +470,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
             relationFacts: soul.relations.renderRelationFacts({ userId: admin, now, sharedStories: soul.memory.sharedStories(admin, 2) }),
             memoryFacts: '',
             bodyFacts: soul.body.renderBodyFacts(now),
+            now,
           },
         )
         if (text) {
@@ -523,18 +541,30 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
     // 11) 唯一生活决策点：收集动机 → 状态连续骰子 → 一次抉择（什么都不做 / 活动 / 说话 / 推进念头）
     const activeDesires = soul.store.listDesires(['active'])
     const socialDesires = activeDesires.filter((d) => d.exitKind === 'social')
-    const actionableDesires = activeDesires.filter((d) => d.exitKind !== 'social')
+    const actionableDesires = activeDesires.filter(
+      (d) => d.exitKind !== 'social' && (desireCooldownUntil.get(d.id) ?? 0) <= now.getTime(),
+    )
 
     const people = allowlist.map((uid) => {
       const lastIso = soul.store.lastUserContactAt(uid)
-      const lastMsgs = soul.store.recentMessages(`qq:private:${uid}`, 1)
+      const recentMsgs = soul.store.recentMessages(`qq:private:${uid}`, 4)
+      const latestMsg = recentMsgs[recentMsgs.length - 1]
+      let unansweredCount = 0
+      for (let i = recentMsgs.length - 1; i >= 0; i--) {
+        if (recentMsgs[i]!.role === 'assistant') unansweredCount += 1
+        else break
+      }
+      const lastMsgMs = latestMsg?.createdAt ? Date.parse(latestMsg.createdAt.replace(' ', 'T')) : undefined
       const lastAtMs = lastIso ? Date.parse(lastIso.replace(' ', 'T')) : undefined
       const rel = soul.relations.get(uid)
       return {
         userId: uid,
         name: soul.relations.nameOf(uid),
         lastAtMs: lastAtMs && Number.isFinite(lastAtMs) ? lastAtMs : undefined,
-        lastText: lastMsgs[0]?.content,
+        lastText: latestMsg?.content,
+        lastRole: latestMsg?.role,
+        unansweredCount,
+        lastMsgAtMs: lastMsgMs && Number.isFinite(lastMsgMs) ? lastMsgMs : undefined,
         stage: rel.stage,
         turns: rel.turns,
         disengagement: rel.disengagement,
@@ -628,6 +658,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
           }),
           memoryFacts: recalled.text,
           bodyFacts: soul.body.renderBodyFacts(now),
+          now,
         },
       )
       if (!text) return
@@ -786,6 +817,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
               }),
               memoryFacts: '',
               bodyFacts: bot.soul.body.renderBodyFacts(now),
+              now,
             },
           )) || `《${work.title}》唱好啦，你听听看。`
 
@@ -849,6 +881,7 @@ export function createRhythm(opts: RhythmOptions): RhythmHandle {
                 }),
                 memoryFacts: '',
                 bodyFacts: bot.soul.body.renderBodyFacts(now),
+                now,
               },
             )
             if (text) {
