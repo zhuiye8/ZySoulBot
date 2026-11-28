@@ -1,19 +1,9 @@
-// 多 Bot 灵魂大厅（/）：框架默认首页，自由选择进入任意角色或查看扩展指南。
-import { motion } from 'motion/react'
-import {
-  BatteryCharging,
-  Flame,
-  BellRing,
-  ArrowRight,
-  Music2,
-  Volume2,
-  MapPin,
-  PlusCircle,
-  Radio,
-} from 'lucide-react'
+// 多角色灵魂大厅（/）：以清晰的操作层级呈现所有已挂载角色。
+import { ArrowRight, BellRing, FolderPlus, Radio, Sparkles } from 'lucide-react'
 import type { BotSummary } from '../lib/api.ts'
+import { AppLink, Badge, EmptyState, Meter } from '../components/ui.tsx'
 
-function moodBadge(p: number, a: number): string {
+function moodLabel(p: number, a: number): string {
   if (p >= 0.35 && a >= 0.2) return '雀跃明朗'
   if (p >= 0.2) return '温柔平和'
   if (p <= -0.25 && a >= 0.2) return '有点紧绷'
@@ -21,151 +11,130 @@ function moodBadge(p: number, a: number): string {
   return '安静惬意'
 }
 
-export function HubView({
-  bots,
-  onSelectBot,
-}: {
-  bots: BotSummary[]
-  onSelectBot: (botId: string) => void
-}) {
+export function HubView({ bots }: { bots: BotSummary[] }) {
   return (
-    <div className="space-y-6">
+    <div className="space-y-8">
       <div className="flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-[22px] font-bold tracking-tight">灵魂角色大厅</h1>
-          <p className="text-xs mt-1" style={{ color: 'var(--text-2)' }}>
-            ZySoulBot 是多角色数字灵魂框架，选择任意一位角色查看当下状态，或随时接入新的自定义人设包。
+        <div className="space-y-1">
+          <h1 className="text-[24px] font-semibold tracking-tight">灵魂角色大厅</h1>
+          <p className="text-[14px]" style={{ color: 'var(--gray-11)' }}>
+            选择一位角色查看此刻身心状态、长期记忆与自主生活记录。
           </p>
         </div>
-        <span className="acg-pill font-mono-num">已挂载 {bots.length} 位角色</span>
+        <span className="font-mono-num text-[12px]" style={{ color: 'var(--gray-11)' }}>
+          共 {bots.length}&nbsp;位角色
+        </span>
       </div>
 
-      <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {bots.map((bot, idx) => {
-          const energyPct = Math.round(bot.energy * 100)
-          const initial = (bot.name || bot.id).slice(0, 1)
-          return (
-            <motion.button
-              key={bot.id}
-              type="button"
-              onClick={() => onSelectBot(bot.id)}
-              initial={{ opacity: 0, y: 12 }}
-              animate={{ opacity: 1, y: 0 }}
-              transition={{ type: 'spring', stiffness: 320, damping: 28, delay: idx * 0.04 }}
-              className="acg-card p-5 text-left flex flex-col justify-between gap-4 hover:-translate-y-0.5 cursor-pointer group"
-            >
-              <div className="space-y-3">
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <div
-                      className="w-12 h-12 rounded-2xl shrink-0 flex items-center justify-center border text-lg font-bold font-voice relative"
-                      style={{
-                        background: 'linear-gradient(135deg, var(--grad-a), var(--grad-b))',
-                        borderColor: 'var(--border)',
-                        color: 'var(--text)',
-                      }}
-                    >
-                      {initial}
-                      <span
-                        className="w-3 h-3 rounded-full border-2 absolute -bottom-0.5 -right-0.5"
+      {bots.length === 0 ? (
+        <div className="ui-panel">
+          <EmptyState
+            icon={Sparkles}
+            title="当前还没有挂载角色"
+            description="在 personas/<id>/ 放入人设包，并在 zysoul.config.json 的 bots 数组中追加配置后重启服务即可启用。"
+          />
+        </div>
+      ) : (
+        <section className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {bots.map((bot) => {
+            const energyPct = Math.round(bot.energy * 100)
+            const initial = (bot.name || bot.id).slice(0, 1)
+            return (
+              <AppLink
+                key={bot.id}
+                to={{ page: 'bot', botId: bot.id, view: 'home' }}
+                className="ui-panel p-5 flex flex-col justify-between gap-4 group transition-colors duration-150 hover:border-[var(--gray-8)]"
+              >
+                <div className="space-y-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <div
+                        className="w-11 h-11 rounded-[10px] border shrink-0 flex items-center justify-center font-voice text-[18px] font-semibold"
                         style={{
-                          backgroundColor: bot.hasTransport ? 'var(--ok)' : 'var(--text-2)',
-                          borderColor: 'var(--surface)',
+                          backgroundColor: 'var(--accent-2)',
+                          borderColor: 'var(--accent-6)',
+                          color: 'var(--accent-11)',
                         }}
-                      />
-                    </div>
-                    <div className="min-w-0">
-                      <div className="text-base font-bold truncate">{bot.name}</div>
-                      <div className="text-[11px] font-mono-num" style={{ color: 'var(--text-2)' }}>
-                        @{bot.id} · {moodBadge(bot.mood.p, bot.mood.a)}
+                      >
+                        {initial}
+                      </div>
+                      <div className="min-w-0">
+                        <div className="text-[16px] font-semibold truncate" style={{ color: 'var(--gray-12)' }}>
+                          {bot.name}
+                        </div>
+                        <div className="text-[12px] font-mono-num truncate" style={{ color: 'var(--gray-11)' }} translate="no">
+                          @{bot.id} · {moodLabel(bot.mood.p, bot.mood.a)}
+                        </div>
                       </div>
                     </div>
+                    <ArrowRight
+                      className="w-4 h-4 shrink-0 mt-1 transition-transform duration-150 group-hover:translate-x-0.5"
+                      style={{ color: 'var(--gray-10)' }}
+                      aria-hidden="true"
+                    />
                   </div>
-                  <ArrowRight
-                    className="w-4 h-4 shrink-0 transition-transform group-hover:translate-x-0.5"
-                    style={{ color: 'var(--accent)' }}
+
+                  <p className="font-voice text-[14px] leading-relaxed line-clamp-2" style={{ color: 'var(--gray-11)' }}>
+                    {bot.activity
+                      ? `正在「${bot.activity.place}」${bot.activity.label}`
+                      : (bot.summary || '此刻很安静，正等待下一次对话。')}
+                  </p>
+
+                  <Meter
+                    label="此刻精力"
+                    value={bot.energy}
+                    displayValue={`${energyPct}%`}
+                    tone={energyPct > 40 ? 'ok' : energyPct > 20 ? 'warn' : 'danger'}
                   />
                 </div>
 
-                <p className="font-voice text-xs leading-relaxed line-clamp-2" style={{ color: 'var(--text-2)' }}>
-                  {bot.activity
-                    ? `此刻正在「${bot.activity.place}」${bot.activity.label}`
-                    : (bot.summary || '静静等待下一次对话。')}
-                </p>
-
-                {/* 精力细条 */}
-                <div className="space-y-1">
-                  <div className="flex items-center justify-between text-[11px]">
-                    <span className="flex items-center gap-1" style={{ color: 'var(--text-2)' }}>
-                      <BatteryCharging className="w-3 h-3" style={{ color: 'var(--ok)' }} />
-                      精力
+                <div
+                  className="pt-3 border-t flex flex-wrap items-center justify-between gap-2 text-[12px]"
+                  style={{ borderColor: 'var(--gray-6)', color: 'var(--gray-11)' }}
+                >
+                  <div className="flex items-center gap-3">
+                    <span className="inline-flex items-center gap-1.5">
+                      <Radio
+                        className="w-3.5 h-3.5"
+                        style={{ color: bot.hasTransport ? 'var(--ok-solid)' : 'var(--gray-9)' }}
+                        aria-hidden="true"
+                      />
+                      {bot.hasTransport ? 'QQ 在线' : '离线'}
                     </span>
-                    <span className="font-mono-num">{energyPct}%</span>
+                    <span className="font-mono-num">{bot.activeDesires}&nbsp;条心事</span>
+                    {(bot.hasTts || bot.hasSinging) && (
+                      <span>{[bot.hasTts ? '语音' : '', bot.hasSinging ? '唱歌' : ''].filter(Boolean).join(' / ')}</span>
+                    )}
                   </div>
-                  <div className="h-1.5 rounded-full overflow-hidden" style={{ backgroundColor: 'var(--surface-2)' }}>
-                    <div
-                      className="h-full rounded-full"
-                      style={{ width: `${energyPct}%`, backgroundColor: energyPct > 40 ? 'var(--ok)' : 'var(--warn)' }}
-                    />
-                  </div>
+                  {bot.pendingTodos > 0 && (
+                    <Badge tone="warn">
+                      <BellRing className="w-3 h-3" aria-hidden="true" />
+                      <span className="font-mono-num">{bot.pendingTodos}&nbsp;待办</span>
+                    </Badge>
+                  )}
                 </div>
-              </div>
+              </AppLink>
+            )
+          })}
+        </section>
+      )}
 
-              <div className="flex flex-wrap items-center gap-1.5 pt-2 border-t" style={{ borderColor: 'var(--border)' }}>
-                <span className="acg-pill py-0.5 text-[11px]">
-                  <Radio className="w-3 h-3" style={{ color: bot.hasTransport ? 'var(--ok)' : 'var(--text-2)' }} />
-                  {bot.hasTransport ? 'QQ 在线' : '离线'}
-                </span>
-                <span className="acg-pill py-0.5 text-[11px]">
-                  <Flame className="w-3 h-3" style={{ color: 'var(--warn)' }} />
-                  {bot.activeDesires} 心事
-                </span>
-                {bot.hasTts && (
-                  <span className="acg-pill py-0.5 text-[11px]">
-                    <Volume2 className="w-3 h-3" style={{ color: 'var(--accent)' }} />
-                    语音
-                  </span>
-                )}
-                {bot.hasSinging && (
-                  <span className="acg-pill py-0.5 text-[11px]">
-                    <Music2 className="w-3 h-3" style={{ color: 'var(--accent)' }} />
-                    唱歌
-                  </span>
-                )}
-                {bot.activity && (
-                  <span className="acg-pill py-0.5 text-[11px]">
-                    <MapPin className="w-3 h-3" style={{ color: 'var(--info)' }} />
-                    活动中
-                  </span>
-                )}
-                {bot.pendingTodos > 0 && (
-                  <span className="acg-pill py-0.5 text-[11px] ml-auto" style={{ color: 'var(--danger)' }}>
-                    <BellRing className="w-3 h-3" />
-                    {bot.pendingTodos} 待办
-                  </span>
-                )}
-              </div>
-            </motion.button>
-          )
-        })}
-
-        {/* 多角色扩展卡片 */}
-        <div
-          className="acg-card p-5 border-dashed flex flex-col justify-between gap-3"
-          style={{ backgroundColor: 'var(--surface-2)' }}
-        >
-          <div className="space-y-2">
-            <div className="flex items-center gap-2 font-semibold text-sm">
-              <PlusCircle className="w-4 h-4" style={{ color: 'var(--accent)' }} />
-              接入新的自定义灵魂
+      {/* 克制的多角色扩展说明条（替代假等权虚线卡片） */}
+      <section
+        className="rounded-[12px] border px-5 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3"
+        style={{ backgroundColor: 'var(--surface-subtle)', borderColor: 'var(--gray-6)' }}
+      >
+        <div className="flex items-start gap-3 min-w-0">
+          <FolderPlus className="w-4 h-4 shrink-0 mt-0.5" style={{ color: 'var(--gray-11)' }} aria-hidden="true" />
+          <div className="min-w-0 space-y-0.5">
+            <div className="text-[13px] font-medium" style={{ color: 'var(--gray-12)' }}>
+              接入新的自定义灵魂角色
             </div>
-            <p className="text-xs leading-relaxed" style={{ color: 'var(--text-2)' }}>
-              每位角色拥有完全独立的 <code>persona-pack</code>、<code>soul.db</code> 记忆库、日记本、表情包与音色配置。
-              在 <code>personas/&lt;新角色&gt;/</code> 放入人设包，并在 <code>zysoul.config.json</code> 的 <code>bots</code> 数组追加一项即可同时运行多位角色。
+            <p className="text-[12px] leading-relaxed" style={{ color: 'var(--gray-11)' }}>
+              每位角色拥有独立的 <code translate="no">persona-pack</code>、<code translate="no">soul.db</code>、日记本与音色配置。在{' '}
+              <code translate="no">personas/&lt;id&gt;/</code> 放入人设包并追加到 <code translate="no">zysoul.config.json</code> 的{' '}
+              <code translate="no">bots</code> 数组即可并行运行。
             </p>
-          </div>
-          <div className="text-[11px] font-mono-num" style={{ color: 'var(--text-2)' }}>
-            personas/&lt;id&gt;/pack.json + activities.json
           </div>
         </div>
       </section>

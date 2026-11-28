@@ -1,6 +1,7 @@
 import { Component } from 'react'
 import type { ErrorInfo, ReactNode } from 'react'
 import { AlertTriangle, RotateCcw } from 'lucide-react'
+import { Button } from './ui.tsx'
 
 interface Props {
   children: ReactNode
@@ -25,28 +26,36 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(_error: Error, _info: ErrorInfo): void {
-    // 交给界面卡片优雅展示，不白屏崩溃
+    // 交给界面错误面板展示，避免整页白屏
   }
 
   render(): ReactNode {
     if (this.state.error) {
       return (
-        <div className="acg-card p-6 space-y-3" style={{ borderColor: 'var(--danger)' }}>
-          <div className="flex items-center gap-2 font-semibold" style={{ color: 'var(--danger)' }}>
-            <AlertTriangle className="w-5 h-5" />
-            页面渲染遇到一点小状况
+        <div
+          role="alert"
+          className="ui-panel p-6 space-y-3"
+          style={{ borderColor: 'var(--danger-border)' }}
+        >
+          <div className="flex items-center gap-2 text-[15px] font-semibold" style={{ color: 'var(--danger-fg)' }}>
+            <AlertTriangle className="w-4 h-4 shrink-0" aria-hidden="true" />
+            页面渲染遇到异常
           </div>
-          <p className="text-xs font-mono-num p-3 rounded-xl overflow-x-auto" style={{ backgroundColor: 'var(--surface-2)', color: 'var(--text-2)' }}>
-            {this.state.error.message}
+          <p className="text-[13px]" style={{ color: 'var(--gray-11)' }}>
+            当前视图发生意外错误，你可以点击下方按钮重新渲染，或切换至其他页面。
           </p>
-          <button
-            type="button"
-            onClick={() => this.setState({ error: null })}
-            className="acg-btn acg-btn-primary text-xs"
+          <pre
+            className="text-[12px] font-mono-num p-3 rounded-[8px] overflow-x-auto m-0"
+            style={{ backgroundColor: 'var(--surface-subtle)', color: 'var(--gray-11)' }}
           >
-            <RotateCcw className="w-3.5 h-3.5" />
-            重试渲染
-          </button>
+            {this.state.error.message}
+          </pre>
+          <div>
+            <Button variant="primary" size="sm" onClick={() => this.setState({ error: null })}>
+              <RotateCcw className="w-3.5 h-3.5" aria-hidden="true" />
+              重新渲染
+            </Button>
+          </div>
         </div>
       )
     }
